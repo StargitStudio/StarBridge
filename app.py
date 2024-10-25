@@ -1,7 +1,8 @@
 
 from flask import Flask, request, jsonify, abort
 import os
-import git
+#import git
+#git.refresh('/usr/bin/git')  # Replace with the actual path to git if different
 from flask import Flask, request, jsonify, Response
 from subprocess import Popen, PIPE
 import subprocess
@@ -13,21 +14,23 @@ import json
 
 app = Flask(__name__)
 
-# Set the repository path
-REPO_PATH = "/root/stargit_live"
+# Load settings from the JSON file
+settings_file_path = os.path.join(os.path.dirname(__file__), 'settings.json')
+with open(settings_file_path) as settings_file:
+    settings = json.load(settings_file)
 
-# Define multiple repositories
-REPOSITORIES = [
-    "/root/stargit_live",
-    "/root/StarBridge"
-]
+GIT_EXECUTABLE = settings.get("git_executable")
+
+# Set the repository path and repositories
+REPO_PATH = settings["repo_path"]
+REPOSITORIES = settings["repositories"]
 
 # Initialize repository object
-repo = git.Repo(REPO_PATH)
+#repo = git.Repo(REPO_PATH)
 
 # HTTPS configuration (add your certificate and key paths)
-CERT_PATH = "/etc/ssl/certs/stargit_dev.crt"
-KEY_PATH = "/etc/ssl/private/stargit.dev.key"
+CERT_PATH = settings['ssl']['cert_path']
+KEY_PATH = settings['ssl']['key_path']
 
 # Example API key storage (in a real-world app, use a database)
 VALID_API_KEYS = {"user123": "your_secure_api_key_here"}
@@ -79,26 +82,6 @@ def run_git_command(path, command):
     except subprocess.CalledProcessError as e:
         return f"Error: {e.stderr.strip()}"
 
-@app.route('/api/revwalk0', methods=['POST'])
-def revwalk0():
-    """
-    API to get a list of recent commits (revwalk)
-    """
-    print("/api/revwalk0", flush=True)
-    check_api_key()
-
-    revs = []
-    for commit in repo.iter_commits(max_count=10):  # Limit to the last 10 commits
-        revs.append({
-            "commit_id": commit.hexsha,
-            "author": commit.author.name,
-            "message": commit.message,
-            "date": commit.committed_datetime.isoformat()
-        })
-
-    return jsonify({"commits": revs}), 200
-
-
 @app.route('/api/revwalk', methods=['POST'])
 def rev_walk():
     print("/api/revwalk", flush=True)
@@ -112,7 +95,10 @@ def rev_walk():
 
     print("path", path, flush=True)
     if not branch:
-        branch = run_git_command(REPO_PATH, ["git", "rev-parse", "--abbrev-ref", "HEAD"])
+        branch = run_git_command(REPO_PATH, [GIT_EXECUTABLE, "rev-parse", "--abbrev-ref", "HEAD"])
+
+    if not path:
+        branch 
         #return jsonify({"error": "Branch is required"}), 400
 
     # Path to repo (adjust if multiple repos)
@@ -122,7 +108,7 @@ def rev_walk():
     repo_path = os.path.join(path, ".git")
 
     # Git command to get commit details with parents, author info, date, and message
-    command = ["git", "-C", path, "log", f"--date=iso", "--pretty=format:%H|%P|%an|%ae|%ad|%s", branch]
+    command = [GIT_EXECUTABLE, "-C", path, "log", f"--date=iso", "--pretty=format:%H|%P|%an|%ae|%ad|%s", branch]
 
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stdout, stderr = process.communicate()
@@ -189,7 +175,7 @@ def diff():
             raise Exception(f"Repository path {path} does not exist")
 
         # Prepare the git command to get the diff
-        git_command = ["git", "-C", path, "diff"]
+        git_command = [GIT_EXECUTABLE, "-C", path, "diff"]
 
         if commit1 and commit2:
             # Get diff between two commits
@@ -223,7 +209,7 @@ def diff():
         if commit:
             # Get the commit details (message, author, email, date, and parents)
             commit_details_command = [
-                "git", "-C", path, "show", "--no-patch", "--format=%B%n%an%n%ae%n%ad%n%P", commit
+                GIT_EXECUTABLE, "-C", path, "show", "--no-patch", "--format=%B%n%an%n%ae%n%ad%n%P", commit
             ]
             result_message = subprocess.run(commit_details_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
@@ -279,7 +265,7 @@ def push():
 
     try:
         # Prepare the git push command
-        git_push_command = ["git", "-C", repo_path, "push", "origin", branch]
+        git_push_command = [GIT_EXECUTABLE, "-C", repo_path, "push", "origin", branch]
 
         # Run the git push command
         result = subprocess.run(git_push_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -322,7 +308,7 @@ def add_remote():
     try:
         # Run git remote add command
         result = subprocess.run(
-            ["git", "remote", "add", remote_name, remote_url],
+            [GIT_EXECUTABLE, "remote", "add", remote_name, remote_url],
             cwd=repo_path,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -371,15 +357,15 @@ def commit():
 
     try:
         # Stage all changes
-        #subprocess.run(["git", "add", "--all"], cwd=REPO_PATH, check=True)
+        #subprocess.run([GIT_EXECUTABLE, "add", "--all"], cwd=REPO_PATH, check=True)
 
         # Commit with the provided message
         author_info = f"{name} <{email}>"
-        subprocess.run(["git", "commit", "--author", author_info, "-a", "-m", commit_message], cwd=path, check=True)
-        #subprocess.run(["git", "commit", "-m", commit_message], cwd=path, check=True)
+        subprocess.run([GIT_EXECUTABLE, "commit", "--author", author_info, "-a", "-m", commit_message], cwd=path, check=True)
+        #subprocess.run([GIT_EXECUTABLE, "commit", "-m", commit_message], cwd=path, check=True)
 
         # Get the latest commit ID
-        result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        result = subprocess.run([GIT_EXECUTABLE, "rev-parse", "HEAD"], cwd=path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         commit_id = result.stdout.decode().strip()
 
         # Return success response with the new commit ID
@@ -435,7 +421,7 @@ def get_current_branch_or_default(repo_path):
     Otherwise, returns the default branch name to be used after the first commit.
     """
    # First, check if there are any commits in the repository
-    log_output = run_git_command(repo_path, ["git", "log", "-1"])  # This will throw an error if there are no commits
+    log_output = run_git_command(repo_path, [GIT_EXECUTABLE, "log", "-1"])  # This will throw an error if there are no commits
     print("git log", log_output, flush=True)
 
     if "does not have any commits yet" in log_output:
@@ -450,7 +436,7 @@ def get_current_branch_or_default(repo_path):
         #return f"Branch '{branch}' has no commits yet."
 
     # If commits exist, get the current branch name
-    branch = run_git_command(repo_path, ["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    branch = run_git_command(repo_path, [GIT_EXECUTABLE, "rev-parse", "--abbrev-ref", "HEAD"])
 
     return {'branch':branch.strip(), 'status_message':''}
 
@@ -475,7 +461,7 @@ def list_repositories():
             branch = get_current_branch_or_default(local_path)
 
             # Get the status of the repository
-            status = run_git_command(local_path, ["git", "status"])
+            status = run_git_command(local_path, [GIT_EXECUTABLE, "status"])
 
             # Determine action status based on the status output
             action_status = "already up to date"  # Default status
@@ -493,7 +479,7 @@ def list_repositories():
                 action_status = "merge"
 
             # Get the remote URL
-            remote = run_git_command(local_path, ["git", "remote", "-v"])
+            remote = run_git_command(local_path, [GIT_EXECUTABLE, "remote", "-v"])
 
             # Parse the remote information to get the URL
             remote_url = None
@@ -1027,6 +1013,8 @@ def update_ref():
 
 # Main entry point for running the server
 if __name__ == '__main__':
+    print("CERT_PATH", CERT_PATH, flush=True)
+    print("KEY_PATH", KEY_PATH, flush=True)
     app.run(ssl_context=(CERT_PATH, KEY_PATH), host='0.0.0.0', port=5001)
 
 
