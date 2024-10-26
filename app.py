@@ -82,6 +82,52 @@ def run_git_command(path, command):
     except subprocess.CalledProcessError as e:
         return f"Error: {e.stderr.strip()}"
 
+@app.route('/api/refs', methods=['POST'])
+def get_refs():
+    print("/api/refs", flush=True)
+
+    check_api_key()  # Your function to verify the API key
+
+    data = request.json
+    repo_path = data.get('repo_path')
+
+    if repo_path not in REPOSITORIES:
+        return jsonify({"error": f"Repository path '{repo_path}' not found in registered repositories"}), 400
+
+    # Get local refs
+    local_refs = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "show-ref"])
+    local_refs_info = []
+    
+    for ref in local_refs.splitlines():
+        if ref.strip():  # Check if the line is not empty
+            sha, name = ref.split(' ', 1)
+            local_refs_info.append({
+                "name": name,
+                "sha": sha
+            })
+
+    # Get remote refs
+    remote_refs = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "ls-remote", "origin"])
+    remote_refs_info = []
+    
+    for ref in remote_refs.splitlines():
+        if ref.strip():  # Check if the line is not empty
+            # Split by whitespace to handle multiple spaces or tabs
+            parts = ref.split()
+            if len(parts) == 2:  # Ensure there are exactly 2 parts
+                sha, name = parts
+                remote_refs_info.append({
+                    "name": name,
+                    "sha": sha
+                })
+            else:
+                print(f"Warning: Unexpected format in remote refs line: {ref}", flush=True)
+
+    return jsonify({
+        "local_refs": local_refs_info,
+        "remote_refs": remote_refs_info
+    }), 200
+
 @app.route('/api/revwalk', methods=['POST'])
 def rev_walk():
     print("/api/revwalk", flush=True)
@@ -389,6 +435,106 @@ def commit():
             "details": e.stderr.decode() if e.stderr else str(e)
         }), 500
 
+@app.route('/api/status', methods=['POST'])
+def get_status():
+    print("/api/status", flush=True)
+    check_api_key()
+
+    data = request.json
+
+    
+    path = data.get('repo_path')
+
+    try:
+        # Run `git status --porcelain` to get a summary of changes
+        result = subprocess.run(
+            [GIT_EXECUTABLE, "status", "--porcelain"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        output = result.stdout.strip().splitlines()
+
+        # Parse the output to categorize files
+        status_summary = {
+            "added": [],
+            "modified": [],
+            "deleted": [],
+            "renamed": [],
+            "untracked": []
+        }
+
+        for line in output:
+            status_code = line[:2].strip()
+            print("status_code", status_code, flush=True)
+            print("line", line, flush=True)
+            file_path = line[3:]
+
+            parts = line.split(maxsplit=2)
+
+            if len(parts) < 2:
+                continue  # Skip lines that don't conform to expected structure
+
+            status_code = parts[0]
+            file_path = parts[1]
+            print("status_code", status_code, flush=True)
+            print("file_path", file_path, flush=True)
+
+            if status_code == "A":  # Added
+                status_summary["added"].append(file_path)
+            elif status_code == "M":  # Modified
+                status_summary["modified"].append(file_path)
+            elif status_code == "D":  # Deleted
+                status_summary["deleted"].append(file_path)
+            elif status_code == "R":  # Renamed (also shows previous path)
+                previous_path, new_path = file_path.split(" -> ")
+                status_summary["renamed"].append({
+                    "from": previous_path,
+                    "to": new_path
+                })
+            elif status_code == "??":  # Untracked
+                status_summary["untracked"].append(file_path)
+
+        print("status_summary", status_summary, flush=True)
+
+        # Generate action message with details about pending changes
+        # has_pending_changes = any(status_summary[key] for key in status_summary)
+        has_pending_changes = any(status_summary[key] for key in status_summary if key != "untracked")
+        only_untracked = bool(status_summary["untracked"]) and not has_pending_changes
+        if has_pending_changes:
+            change_details = []
+
+            # Only include details with non-zero counts
+            if status_summary["added"]:
+                change_details.append(f"{len(status_summary['added'])} added")
+            if status_summary["modified"]:
+                change_details.append(f"{len(status_summary['modified'])} modified")
+            if status_summary["deleted"]:
+                change_details.append(f"{len(status_summary['deleted'])} deleted")
+            if status_summary["renamed"]:
+                change_details.append(f"{len(status_summary['renamed'])} renamed")
+            if status_summary["untracked"]:
+                change_details.append(f"{len(status_summary['untracked'])} untracked")
+
+            # Join change details to form the message
+            action_message = f"Pending changes detected: {', '.join(change_details)}. Please commit or stash your changes."
+        elif only_untracked:
+            action_message = f"{len(status_summary['untracked'])} untracked file(s) detected. You may want to add them to the repository."
+        else:
+            action_message = "No changes detected. Working directory is clean."
+
+        return jsonify({
+            "summary": status_summary,
+            "action_message": action_message,
+            "message": "Git status retrieved successfully."
+        })
+
+    except subprocess.CalledProcessError as e:
+        return jsonify({
+            "error": "An error occurred while running git status.",
+            "details": str(e)
+        }), 500
 
 @app.route('/api/pull', methods=['POST'])
 def pull():
