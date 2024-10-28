@@ -11,6 +11,7 @@ import re
 import uuid
 import time
 import json
+import requests
 
 app = Flask(__name__)
 
@@ -22,6 +23,7 @@ with open(settings_file_path) as settings_file:
 GIT_EXECUTABLE = settings.get("git_executable")
 
 # Set the repository path and repositories
+REPOS_BASE_PATH = settings["repos_base_path"]
 REPO_PATH = settings["repo_path"]
 REPOSITORIES = settings["repositories"]
 
@@ -32,14 +34,42 @@ REPOSITORIES = settings["repositories"]
 CERT_PATH = settings['ssl']['cert_path']
 KEY_PATH = settings['ssl']['key_path']
 
+STARGIT_URL = "https://stargit.com/api/tokens/validate"
+
 # Example API key storage (in a real-world app, use a database)
 VALID_API_KEYS = {"user123": "your_secure_api_key_here"}
 
 # API key check that aborts if the key is invalid (no return to parent function)
 def check_api_key():
-    if request.headers.get('x-api-key') not in VALID_API_KEYS.values():
-        print("Invalid key", flush=True)
+    print("check_api_key", flush=True)
+    xapi = request.headers.get('x-api-key')
+    auth = request.headers.get('Authorization')
+    if xapi:
+        if xapi not in VALID_API_KEYS.values():
+            print("Invalid key", flush=True)
+            abort(401, description="Unauthorized access, invalid API key")
+    elif auth:
+        print("found Authorization:", auth, flush=True)
+        headers = {
+            'Authorization': auth,
+            "Content-Type": "application/json"
+        }
+        try:
+            print("sending request", flush=True)
+            response = requests.post(STARGIT_URL, headers=headers)
+
+            if response.status_code == 200:
+                print("response", response.json(), flush=True)
+                # If the request is successful, print the returned data
+                #print("Response:", response, flush=True)
+            else:
+                abort(401, description="Unauthorized access, invalid Token")
+        except requests.exceptions.HTTPError as err:
+            abort(401, description=f"Error occurred: {err}")  # Print any HTTP errors
+
+    else:       
         abort(401, description="Unauthorized access, invalid API key")
+
 
 def validate_session(lock_path, session_id):
     """
@@ -140,9 +170,7 @@ def rev_walk():
     mod = data.get('mod', None)  # Optional
 
     print("path", path, flush=True)
-    if not branch:
-        branch = run_git_command(REPO_PATH, [GIT_EXECUTABLE, "rev-parse", "--abbrev-ref", "HEAD"])
-
+    
     if not path:
         branch 
         #return jsonify({"error": "Branch is required"}), 400
@@ -594,7 +622,113 @@ def get_current_branch_or_default(repo_path):
 
     return {'branch':branch.strip(), 'status_message':''}
 
+@app.route('/user/repos', methods=['POST'])
+def create_user_repos():
+    print("/user/repos", flush=True)
 
+    check_api_key()
+
+    # Get JSON payload
+    data = request.get_json()
+
+    # Validate the incoming JSON data
+    if not data or 'name' not in data:
+        return jsonify({'message': 'Invalid input! Name is required.'}), 400
+
+    repo_name = data['name']
+
+    # Create the directory for the new repository
+    repo_path = os.path.join(REPOS_BASE_PATH, repo_name)
+
+    try:
+        # Initialize a new Git repository
+        subprocess.run(['git', 'init', repo_path], check=True)
+        
+
+        ### Create a README file with the description
+        #with open(os.path.join(repo_path, 'README.md'), 'w') as readme_file:
+        #    readme_file.write(f"# {repo_name}\n\n{repo_description}")
+
+        print("Repository created successfully!", flush=True)
+        return jsonify({'message': 'Repository created successfully!', 'name': repo_name}), 201
+
+    except subprocess.CalledProcessError:
+        print("Failed to create the repository", flush=True)
+        return jsonify({'message': 'Failed to create the repository!'}), 500
+
+    except Exception as e:
+        print("Exception; repository create:", str(e), flush=True)
+        return jsonify({'message': str(e)}), 500
+
+@app.route('/user/repos', methods=['GET'])
+def list_user_repos():
+    print("/user/repos", flush=True)
+
+    check_api_key()
+
+    auth_token = request.headers.get('Authorization')
+
+    print("auth_token", auth_token)
+
+    repositories = []
+    index = 0
+
+    for repo_path in REPOSITORIES:
+        # Get the repository name and local path
+        repo_name = os.path.basename(repo_path)
+        local_path = repo_path
+
+        # Get the current branch
+        branch = get_current_branch_or_default(local_path)
+
+        # Get the status of the repository
+        status = run_git_command(local_path, [GIT_EXECUTABLE, "status"])
+
+        # Determine action status based on the status output
+        action_status = "already up to date"  # Default status
+        if "Changes to be committed" in status:
+            action_status = "need to commit"
+        elif "Changes not staged for commit" in status:
+            action_status = "need to commit"
+        elif "Untracked files" in status:
+            action_status = "need to commit"
+        elif "Your branch is ahead" in status:
+            action_status = "ready to push"
+        elif "Your branch is behind" in status:
+            action_status = "ready to pull"
+        elif "You have unmerged paths" in status:
+            action_status = "merge"
+
+        # Get the remote URL
+        remote = run_git_command(local_path, [GIT_EXECUTABLE, "remote", "-v"])
+
+        # Parse the remote information to get the URL
+        remote_url = None
+        if remote:
+            remote_lines = remote.splitlines()
+            remote_url = remote_lines[0].split()[1] if remote_lines else None
+
+        # Append the repository information to the list
+        repositories.append({
+            "name": repo_name,
+            "id": index,
+            "local_path": local_path,
+            "status": status,
+            "action_status": action_status,
+            "branch": branch['branch'],
+            "status_message": branch['status_message'],
+            "remote": remote_url,
+            "description": "Stargit Repository"
+        })
+
+        index += 1
+
+    # Construct the response
+    response = {
+        "repositories": repositories
+    }
+
+    return jsonify(repositories), 200
 
 @app.route('/api/repositories', methods=['GET'])
 def list_repositories():
