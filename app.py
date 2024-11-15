@@ -23,8 +23,8 @@ with open(settings_file_path) as settings_file:
 GIT_EXECUTABLE = settings.get("git_executable")
 
 # Set the repository path and repositories
-REPOS_BASE_PATH = settings["repos_base_path"]
-REPO_PATH = settings["repo_path"]
+#REPOS_BASE_PATH = settings["repos_base_path"]
+#REPO_PATH = settings["repo_path"]
 REPOSITORIES = settings["repositories"]
 
 # Initialize repository object
@@ -33,6 +33,9 @@ REPOSITORIES = settings["repositories"]
 # HTTPS configuration (add your certificate and key paths)
 CERT_PATH = settings['ssl']['cert_path']
 KEY_PATH = settings['ssl']['key_path']
+
+print("CERT_PATH", CERT_PATH, flush=True)
+print("KEY_PATH", KEY_PATH, flush=True)
 
 STARGIT_URL = "https://stargit.com/api/tokens/validate"
 
@@ -952,6 +955,7 @@ def list_repositories():
     try:
         repositories = []
         for repo_path in REPOSITORIES:
+            print("Processing repository ", repo_path, flush=True)
             # Get the repository name and local path
             repo_name = os.path.basename(repo_path)
             local_path = repo_path
@@ -1005,6 +1009,7 @@ def list_repositories():
         return jsonify(response), 200
 
     except Exception as e:
+        print("An exception occured", str(e), flush=True)
         return jsonify({"error": str(e)}), 500
 
 
