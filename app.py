@@ -188,6 +188,35 @@ def get_refs():
 
     return jsonify(result), 200
 
+@app.route('/api/add', methods=['POST'])
+def git_add_file():
+    print("/api/add", flush=True)
+
+    check_api_key()  # Your function to verify the API key
+
+    data = request.json
+    repo_path = data.get('repo_path')
+    path_file_name_to_add = data.get('path_file')
+
+    # Validate inputs
+    if not repo_path or not path_file_name_to_add:
+        return jsonify({"error": "Both 'repo_path' and 'path_file' are required"}), 400
+
+    if repo_path not in REPOSITORIES:
+        return jsonify({"error": f"Repository path '{repo_path}' not found in registered repositories"}), 400
+
+    # Run git add command
+    try:
+        print("Adding file to repository...", flush=True)
+        add_result = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "add", path_file_name_to_add])
+        if add_result.strip():  # Check if git add produced any output
+            print(f"Git add output: {add_result}", flush=True)
+        
+        return jsonify({"success": True, "message": f"File '{path_file_name_to_add}' added successfully"}), 200
+    except Exception as e:
+        print(f"Error during git add: {str(e)}", flush=True)
+        return jsonify({"error": f"Failed to add file '{path_file_name_to_add}': {str(e)}"}), 500
+
 @app.route('/api/branch', methods=['POST'])
 def get_branches():
     print("/api/branch", flush=True)
@@ -1702,4 +1731,4 @@ if __name__ == '__main__':
     print("KEY_PATH", KEY_PATH, flush=True)
     app.run(ssl_context=(CERT_PATH, KEY_PATH), host='0.0.0.0', port=5001)
 
-
+print("StarBridge online", flush=True)
