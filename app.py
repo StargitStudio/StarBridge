@@ -493,6 +493,42 @@ def push():
             "details": str(e)
         }), 500
 
+@app.route('/api/pull', methods=['POST'])
+def git_pull():
+    """
+    Perform a git pull operation on the specified repository.
+    """
+    print("/api/pull", flush=True)
+
+    # Verify API key (if implemented in your application)
+    check_api_key()  
+
+    # Parse request data
+    data = request.json
+    repo_path = data.get('repo_path')
+
+    # Validate input
+    if not repo_path:
+        return jsonify({"error": "'repo_path' is required"}), 400
+
+    if repo_path not in REPOSITORIES:
+        return jsonify({"error": f"Repository path '{repo_path}' not found in registered repositories"}), 400
+
+    # Run git pull command
+    try:
+        print(f"Running git pull for repository at {repo_path}...", flush=True)
+        pull_result = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "pull"])
+        print(f"Git pull output: {pull_result}", flush=True)
+
+        return jsonify({
+            "success": True,
+            "message": "Git pull executed successfully",
+            "output": pull_result
+        }), 200
+    except Exception as e:
+        print(f"Error during git pull: {str(e)}", flush=True)
+        return jsonify({"error": f"Failed to pull repository '{repo_path}': {str(e)}"}), 500
+    
 @app.route('/api/add-remote', methods=['POST'])
 def add_remote():
     """
@@ -690,18 +726,18 @@ def get_status():
             "details": str(e)
         }), 500
 
-@app.route('/api/pull', methods=['POST'])
-def pull():
-    """
-    API to pull changes from remote
-    """
-    check_api_key()
-    try:
-        origin = repo.remotes.origin
-        pull_info = origin.pull()
-        return jsonify({"status": "Pull successful", "info": str(pull_info)}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+#@app.route('/api/pull', methods=['POST'])
+#def pull():
+#    """
+#    API to pull changes from remote
+#    """
+#    check_api_key()
+#    try:
+#        origin = repo.remotes.origin
+#        pull_info = origin.pull()
+#        return jsonify({"status": "Pull successful", "info": str(pull_info)}), 200
+#    except Exception as e:
+#        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/pull/object', methods=['GET'])
 def pull_object():
