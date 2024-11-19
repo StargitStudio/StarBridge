@@ -498,6 +498,8 @@ def git_pull():
     """
     Perform a git pull operation on the specified repository.
     """
+
+    
     print("/api/pull", flush=True)
 
     # Verify API key (if implemented in your application)
