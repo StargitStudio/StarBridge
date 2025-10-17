@@ -744,11 +744,13 @@ def get_status():
         })
 
     except subprocess.CalledProcessError as e:
-        logger.error("Error running git status: %s", e.stderr.decode().strip() if e.stderr else str(e))
-        return jsonify({
-            "error": "An error occurred while running git status.",
-            "details": str(e)
-        }), 500
+        # stderr is already a string since text=True in run_git_command
+        error_message = e.stderr.strip() if e.stderr else str(e)
+        logger.error("Failed to retrieve status: %s", error_message)
+        return jsonify({"error": f"Failed to retrieve status: {error_message}"}), 500
+    except Exception as e:
+        logger.error("Unexpected error in get_status: %s", str(e))
+        return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
 
 #@app.route('/api/pull', methods=['POST'])
 #def pull():
