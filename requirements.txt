@@ -2,3 +2,5 @@ Flask
 GitPython
 gunicorn
 requests
+python-dotenv
+cryptography

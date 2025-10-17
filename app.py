@@ -1,8 +1,7 @@
 
 from flask import Flask, request, jsonify, abort, make_response, send_file
 import os
-#import git
-#git.refresh('/usr/bin/git')  # Replace with the actual path to git if different
+from dotenv import load_dotenv
 from flask import Flask, request, jsonify, Response
 from subprocess import Popen, PIPE
 import subprocess
@@ -12,6 +11,22 @@ import uuid
 import time
 import json
 import requests
+import logging
+from logging.handlers import RotatingFileHandler
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        RotatingFileHandler('starbridge.log', maxBytes=1000000, backupCount=5),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('StarBridge')
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = Flask(__name__)
 
@@ -21,79 +36,50 @@ with open(settings_file_path) as settings_file:
     settings = json.load(settings_file)
 
 GIT_EXECUTABLE = settings.get("git_executable")
-
-# Set the repository path and repositories
-#REPOS_BASE_PATH = settings["repos_base_path"]
-#REPO_PATH = settings["repo_path"]
 REPOSITORIES = settings["repositories"]
-
-# Initialize repository object
-#repo = git.Repo(REPO_PATH)
-
-# HTTPS configuration (add your certificate and key paths)
 CERT_PATH = settings['ssl']['cert_path']
 KEY_PATH = settings['ssl']['key_path']
-
-print("CERT_PATH", CERT_PATH, flush=True)
-print("KEY_PATH", KEY_PATH, flush=True)
-
 STARGIT_URL = "https://stargit.com/api/tokens/validate"
 
-# Example API key storage (in a real-world app, use a database)
-VALID_API_KEYS = {"user123": "your_secure_api_key_here"}
+SSL_MODE = os.getenv('SSL_MODE', 'none').lower()
+
+# Load the API key from environment variable
+API_KEY = os.getenv('STARBRIDGE_API_KEY')
+if not API_KEY:
+    logger.error("STARBRIDGE_API_KEY not set in .env file")
+    raise RuntimeError("STARBRIDGE_API_KEY not set in .env file. Run `python setup.py` to generate one.")
 
 # API key check that aborts if the key is invalid (no return to parent function)
 def check_api_key():
-    print("check_api_key", flush=True)
-    print("request.headers", request.headers, flush=True)
+    logger.debug("Checking API key")
     xapi = request.headers.get('x-api-key')
-
-
-    try:
-        xapi = request.headers.get('x-api-key')
-
-    except ValueError as e:
-        # Log the error for debugging
-        print(f"Error: {e}", flush=True)
-        # Respond with a clear error message
-        abort(401, description="Starbridge passphrase is missing. Please define it on the client.")
-
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        abort(401, description="Unauthorized access, unexpected X API key")
-        return jsonify({"error": "An unexpected error occurred"}), 500
-
-
-
     auth = request.headers.get('Authorization')
+
     if xapi:
-        print("found xapi", flush=True)
-        if xapi not in VALID_API_KEYS.values():
-            print("Invalid key", flush=True)
+        if xapi != API_KEY:
+            logger.warning("Invalid API key provided")
             abort(401, description="Unauthorized access, invalid API key")
-        print("found valid x-api-key", flush=True)
+        # Valid x-api-key; proceed
     elif auth:
-        print("found Authorization:", auth, flush=True)
+        logger.debug("Checking StarGit token via %s", STARGIT_URL)
         headers = {
             'Authorization': auth,
             "Content-Type": "application/json"
         }
         try:
-            print("sending request", flush=True)
             response = requests.post(STARGIT_URL, headers=headers)
-
-            if response.status_code == 200:
-                print("response", response.json(), flush=True)
-                # If the request is successful, print the returned data
-                #print("Response:", response, flush=True)
-            else:
+            if response.status_code != 200:
+                logger.warning("Invalid StarGit token, status code: %s", response.status_code)
                 abort(401, description="Unauthorized access, invalid Token")
         except requests.exceptions.HTTPError as err:
-            abort(401, description=f"Error occurred: {err}")  # Print any HTTP errors
-
-    else:       
-        abort(401, description="Unauthorized access, invalid API key")
-
+            logger.error("HTTP error during token validation: %s", err)
+            abort(401, description=f"Error occurred: {err}")
+        except Exception as e:
+            logger.error("Unexpected error during token validation: %s", e)
+            abort(500, description="An unexpected error occurred during token validation")
+    else:
+        logger.warning("No API key or token provided")
+        abort(401, description="Unauthorized access, no API key or token provided")
 
 def validate_session(lock_path, session_id):
     """
@@ -106,10 +92,11 @@ def validate_session(lock_path, session_id):
     Returns:
     - Tuple: (is_valid, error_message). If valid, returns (True, None), else returns (False, "Error message").
     """
-
+    logger.debug("Validating session for lock_path: %s, session_id: %s", lock_path, session_id)
     # Check if the lock file exists
     if not os.path.exists(lock_path):
         error_msg = f"Missing lock for valid push session on {lock_path}."
+        logger.error(error_msg)
         return False, error_msg
 
     # Read the lock file and check the session ID
@@ -119,6 +106,7 @@ def validate_session(lock_path, session_id):
             # Ensure the session_id in the lock matches the provided session_id
             if lock_data.get('session_id') != session_id:
                 error_msg = f"Invalid session ID {session_id} for lock at {lock_path}."
+                logger.warning(error_msg)
                 return False, error_msg
     except Exception as e:
         # If there is any issue reading or parsing the lock file, return an error
@@ -126,30 +114,33 @@ def validate_session(lock_path, session_id):
         return False, error_msg
 
     # If all checks pass, return valid
+    logger.debug("Session validated successfully")
     return True, None
 
 def run_git_command(path, command):
     """Utility function to run a git command and return the output."""
+    logger.debug("Running git command: %s in path: %s", command, path)
     try:
         result = subprocess.run(command, cwd=path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        logger.debug("Git command output: %s", result.stdout.strip())
         return result.stdout.strip()
     except subprocess.CalledProcessError as e:
+        logger.error("Git command error: %s", e.stderr.strip())
         return f"Error: {e.stderr.strip()}"
 
 @app.route('/api/refs', methods=['POST'])
 def get_refs():
-    print("/api/refs", flush=True)
-
+    logger.info("API endpoint /api/refs called")
     check_api_key()  # Your function to verify the API key
-
     data = request.json
     repo_path = data.get('repo_path')
+    logger.debug("Processing refs for repo_path: %s", repo_path)
 
     if repo_path not in REPOSITORIES:
+        logger.warning("Repository path '%s' not found in registered repositories", repo_path)
         return jsonify({"error": f"Repository path '{repo_path}' not found in registered repositories"}), 400
 
     # Get local refs
-    print("run 1", flush=True)
     local_refs = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "show-ref"])
     local_refs_info = []
     
@@ -161,13 +152,10 @@ def get_refs():
                 "sha": sha
             })
 
-    print("run 2", flush=True)
     # Get remote refs
     remote_refs = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "ls-remote"])
     remote_refs_info = []
-    
-    print("remote_refs", remote_refs, flush=True)
-    
+   
     for ref in remote_refs.splitlines():
         if ref.strip():  # Check if the line is not empty
             # Split by whitespace to handle multiple spaces or tabs
@@ -179,30 +167,31 @@ def get_refs():
                     "sha": sha
                 })
             else:
-                print(f"Warning: Unexpected format in remote refs line: {ref}", flush=True)
+                logger.warning("Unexpected format in remote refs line: %s", ref)
 
     result = {
         "local_refs": local_refs_info,
         "remote_refs": remote_refs_info
     }
-
+    logger.debug("Returning refs: %s", result)
     return jsonify(result), 200
 
 @app.route('/api/add', methods=['POST'])
 def git_add_file():
-    print("/api/add", flush=True)
-
+    logger.info("API endpoint /api/add called")
     check_api_key()  # Your function to verify the API key
-
     data = request.json
     repo_path = data.get('repo_path')
     path_file_name_to_add = data.get('path_file')
+    logger.debug("Adding file: %s in repo: %s", path_file_name_to_add, repo_path)
 
     # Validate inputs
     if not repo_path or not path_file_name_to_add:
+        logger.warning("Missing required parameters: repo_path or path_file")
         return jsonify({"error": "Both 'repo_path' and 'path_file' are required"}), 400
 
     if repo_path not in REPOSITORIES:
+        logger.warning("Repository path '%s' not found in registered repositories", repo_path)
         return jsonify({"error": f"Repository path '{repo_path}' not found in registered repositories"}), 400
 
     # Run git add command
@@ -210,32 +199,31 @@ def git_add_file():
         print("Adding file to repository...", flush=True)
         add_result = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "add", path_file_name_to_add])
         if add_result.strip():  # Check if git add produced any output
-            print(f"Git add output: {add_result}", flush=True)
-        
+            logger.debug("Git add output: %s", add_result)
+        logger.info("File '%s' added successfully", path_file_name_to_add)
         return jsonify({"success": True, "message": f"File '{path_file_name_to_add}' added successfully"}), 200
     except Exception as e:
-        print(f"Error during git add: {str(e)}", flush=True)
+        logger.error("Failed to add file '%s': %s", path_file_name_to_add, str(e))
         return jsonify({"error": f"Failed to add file '{path_file_name_to_add}': {str(e)}"}), 500
 
 @app.route('/api/branch', methods=['POST'])
 def get_branches():
-    print("/api/branch", flush=True)
-
+    logger.info("API endpoint /api/branch called")
     check_api_key()  # Verify the API key
-
     data = request.json
     repo_path = data.get('repo_path')
+    logger.debug("Fetching branches for repo_path: %s", repo_path)
 
     # Check if the repository exists
     if repo_path not in REPOSITORIES:
-        print(f"Repository path '{repo_path}' not found in registered repositories", flush=True)
+        logger.warning("Repository path '%s' not found in registered repositories", repo_path)
         return jsonify({"error": f"Repository path '{repo_path}' not found in registered repositories"}), 400
 
     # Get local branches
     try:
         local_branches = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "branch", "--format", "%(refname:short)"])
     except subprocess.CalledProcessError as e:
-        print(f"Failed to retrieve local branches: {e}", flush=True)
+        logger.error("Failed to retrieve local branches: %s", e)
         return jsonify({"error": f"Failed to retrieve local branches: {e}"}), 500
 
     # Parse local branches
@@ -250,7 +238,7 @@ def get_branches():
     try:
         remote_branches = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "branch", "-r", "--format", "%(refname:short)"])
     except subprocess.CalledProcessError as e:
-        print(f"Failed to retrieve remote branches: {e}", flush=True)
+        logger.error("Failed to retrieve remote branches: %s", e)
         return jsonify({"error": f"Failed to retrieve remote branches: {e}"}), 500
 
     # Parse remote branches
@@ -266,28 +254,29 @@ def get_branches():
         "remote_branches": remote_branches_info
     }
 
-    print("return ", result, flush=True)
+    logger.debug("Returning branches: %s", result)
     # Return the branch information
     return jsonify(result), 200
 
 
 @app.route('/api/remotes', methods=['POST'])
 def get_remotes():
-    print("/api/remotes", flush=True)
-
+    logger.info("API endpoint /api/remotes called")
     check_api_key()  # Verify the API key
-
     data = request.json
     repo_path = data.get('repo_path')
+    logger.debug("Fetching remotes for repo_path: %s", repo_path)
 
     # Check if the repository exists
     if repo_path not in REPOSITORIES:
+        logger.warning("Repository path '%s' not found in registered repositories", repo_path)
         return jsonify({"error": f"Repository path '{repo_path}' not found in registered repositories"}), 400
 
     # Get list of remotes
     try:
         remotes = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "remote", "-v"])
     except subprocess.CalledProcessError as e:
+        logger.error("Failed to retrieve remotes: %s", e)
         return jsonify({"error": f"Failed to retrieve remotes: {e}"}), 500
 
     # Parse remote information
@@ -310,28 +299,26 @@ def get_remotes():
     result = {
         "remotes": remotes_info
     }
-    print("result", result, flush=True)
+    logger.debug("Returning remotes: %s", result)
     return jsonify(result), 200
 
 @app.route('/api/revwalk', methods=['POST'])
 def rev_walk():
-    print("/api/revwalk", flush=True)
-
+    logger.info("API endpoint /api/revwalk called")
     check_api_key()  # Your function to verify the API key
-
     data = request.json
     branch = data.get('branch')
     path = data.get('repo_path')
     mod = data.get('mod', None)  # Optional
-
-    print("path", path, flush=True)
+    logger.debug("Processing revwalk for repo_path: %s, branch: %s", path, branch)
     
     if not path:
+        logger.warning("Repository path is required")
         branch 
-        #return jsonify({"error": "Branch is required"}), 400
 
     # Path to repo (adjust if multiple repos)
     if path not in REPOSITORIES:
+        logger.warning("Repository path '%s' not found in registered repositories", path)
         return jsonify({"error": f"Repository path '{path}' not found in registered repositories"}), 400
 
     repo_path = os.path.join(path, ".git")
@@ -358,7 +345,7 @@ def rev_walk():
     # Parse the output (SHA with parents, author, email, date, and message)
     commits = stdout.decode('utf-8').splitlines()
 
-    # Example return structure
+    # Return structure
     commit_list = []
     for commit_line in commits:
         # Splitting each line based on the '|' delimiter added in --pretty=format
@@ -375,7 +362,7 @@ def rev_walk():
         }
         commit_list.append(commit_info)
 
-    #print("commits", commit_list, flush=True)
+    logger.debug("Returning %d commits", len(commit_list))
     return jsonify({"commits": commit_list}), 200
 
 @app.route('/api/diff', methods=['POST'])
@@ -384,7 +371,7 @@ def diff():
     API to get the diff of uncommitted changes, a single commit, or between two commits.
     If a single commit is provided, also return the commit details (message, author, email, date, parents).
     """
-    print("/api/diff", flush=True)
+    logger.info("API endpoint /api/diff called")
     check_api_key()
     data = request.json
     path = data.get('repo_path')
@@ -395,12 +382,17 @@ def diff():
     # Define a size limit for the diff output (e.g., 5 MB)
     DIFF_CUTOFF_SIZE = 1 * 1024 * 1024  # 5 MB in bytes
 
-    if path not in REPOSITORIES:
-        return jsonify({"error": f"Repository path '{path}' not found in registered repositories"}), 400
+    if not repo_path:
+        logger.warning("Repository path is required")
+        return jsonify({"error": "Repository path is required"}), 400
 
+    if path not in REPOSITORIES:
+        logger.warning("Repository path '%s' not found in registered repositories", repo_path)
+        return jsonify({"error": f"Repository path '{path}' not found in registered repositories"}), 400
 
     try:
         if not os.path.isdir(path):
+            logger.error("Repository path '%s' does not exist", path)
             raise Exception(f"Repository path {path} does not exist")
 
         # Prepare the git command to get the diff
@@ -421,6 +413,7 @@ def diff():
         result = subprocess.run(git_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         if result.returncode != 0:
+            logger.error("Error running git diff: %s", result.stderr)
             raise Exception(f"Error running git diff: {result.stderr}")
 
         diff_output = result.stdout
@@ -432,7 +425,7 @@ def diff():
             diff_output = diff_output[:DIFF_CUTOFF_SIZE]
             truncated = True
 
-        print(f"diff len: {original_diff_size} -> {len(diff_output)}, truncated: {truncated} ", flush=True)
+        logger.debug("Diff length: %d -> %d, truncated: %s", original_diff_size, len(diff_output), truncated)
 
         commit_details = None
         if commit:
@@ -443,6 +436,7 @@ def diff():
             result_message = subprocess.run(commit_details_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
             if result_message.returncode != 0:
+                logger.error("Error getting commit details: %s", result_message.stderr)
                 raise Exception(f"Error getting commit details: {result_message.stderr}")
 
             commit_output = result_message.stdout.strip().splitlines()
@@ -474,6 +468,7 @@ def diff():
         }), 200
 
     except Exception as e:
+        logger.error("Error in /api/diff: %s", str(e))
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/push', methods=['POST'])
@@ -482,7 +477,7 @@ def push():
     API to push changes to a remote repository.
     Expects JSON with the repo_path and optional branch.
     """
-    print("/api/push", flush=True)
+    logger.info("API endpoint /api/push called")
     check_api_key()  # Function to verify the API key
 
     data = request.json
@@ -490,26 +485,21 @@ def push():
     branch = data.get('branch', 'master')  # Default to 'main' if branch is not specified
     remote = data.get('remote', 'origin') # Default to 'origin' if remote is not specified
 
-    print("data", data, flush=True)
-    print("branch", branch, flush=True)
-    print("remote", remote, flush=True)
+    logger.debug("Pushing to data: %s, branch: %s, remote: %s", data, branch, remote)
 
     if repo_path not in REPOSITORIES:
+        logger.error("Repository path '%s' not found in registered repositories", repo_path)
         return jsonify({"error": f"Repository path '{repo_path}' not found in registered repositories"}), 400
 
-    print("found repository", flush=True)
-
     try:
-        print("try to push", flush=True)
         # Prepare the git push command
         git_push_command = [GIT_EXECUTABLE, "-C", repo_path, "push", remote, branch]
 
         # Run the git push command
         result = subprocess.run(git_push_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-        print("result from push:", result, flush=True)
-
         if result.returncode != 0:
+            logger.error("Error pushing changes: %s", result.stderr.strip())
             raise Exception(f"Error pushing changes: {result.stderr.strip()}")
 
         # Return success response
@@ -519,7 +509,7 @@ def push():
         }), 200
 
     except Exception as e:
-        print("Push exception generated:", str(e), flush=True)
+        logger.error("Push exception generated: %s", str(e))
         return jsonify({
             "error": "Push command failed",
             "details": str(e)
@@ -530,13 +520,9 @@ def git_pull():
     """
     Perform a git pull operation on the specified repository.
     """
-
-
-    print("/api/pull", flush=True)
-
+    logger.info("API endpoint /api/pull called")
     # Verify API key (if implemented in your application)
     check_api_key()  
-
     # Parse request data
     data = request.json
     repo_path = data.get('repo_path')
@@ -544,28 +530,31 @@ def git_pull():
 
     # Validate input
     if not repo_path:
+        logger.error("'repo_path' is required")
         return jsonify({"error": "'repo_path' is required"}), 400
     
     # Validate input
     if not pull_mode:
+        logger.error("'pull_mode' is required")
         return jsonify({"error": "'pull_mode' is required"}), 400
 
     if repo_path not in REPOSITORIES:
+        logger.error("Repository path '%s' not found in registered repositories", repo_path)
         return jsonify({"error": f"Repository path '{repo_path}' not found in registered repositories"}), 400
 
     # Run git pull command
     try:
-        print(f"Running git pull for repository at {repo_path}...", flush=True)
+        logger.debug("Running git pull for repository at %s with mode %s", repo_path, pull_mode)
         pull_result = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "pull", pull_mode])
-        print(f"Git pull output: {pull_result}", flush=True)
-
+        logger.debug("Git pull output: %s", pull_result)
+        
         return jsonify({
             "success": True,
             "message": "Git pull executed successfully",
             "output": pull_result
         }), 200
     except Exception as e:
-        print(f"Error during git pull: {str(e)}", flush=True)
+        logger.error("Error during git pull: %s", str(e))
         return jsonify({"error": f"Failed to pull repository '{repo_path}': {str(e)}"}), 500
     
 @app.route('/api/add-remote', methods=['POST'])
@@ -574,18 +563,19 @@ def add_remote():
     API to add a new remote to a Git repository.
     Example: git remote add origin git@stargit.gamefusion.io:GameFusion/Python/StarBridge.git
     """
-    print("/api/add-remote", flush=True)
+    logger.info("API endpoint /api/add-remote called")
     check_api_key()
-
     data = request.json
     remote_name = data.get('remote_name', 'origin')
     remote_url = data.get('remote_url')
     repo_path = data.get('repo_path')
 
     if not remote_url:
+        logger.error("Remote URL is required")
         return jsonify({"error": "Remote URL is required"}), 400
 
     if not repo_path or repo_path not in REPOSITORIES:
+        logger.error("Repository path '%s' not found in registered repositories", repo_path)
         return jsonify({"error": f"Repository path '{repo_path}' not found in registered repositories"}), 400
 
     try:
@@ -599,6 +589,7 @@ def add_remote():
         )
 
         if result.returncode != 0:
+            logger.error("Error adding remote: %s", result.stderr.strip())
             raise Exception(f"Error adding remote: {result.stderr}")
 
         # Return success response
@@ -610,6 +601,7 @@ def add_remote():
 
     except Exception as e:
         # Handle errors during remote add
+        logger.error("Exception adding remote: %s", str(e))
         return jsonify({
             "error": str(e)
         }), 500
@@ -620,24 +612,23 @@ def commit():
     API to stage changes and commit with the provided message.
     Returns the new commit ID on success.
     """
-    print("/api/commit", flush=True)
+    logger.info("API endpoint /api/commit called")
     check_api_key()
-
     data = request.json
-
     name = data.get('name')
     email = data.get('email')
     path = data.get('repo_path')
     commit_message = data.get('message', 'Default commit message')
-
-    print("name", name, flush=True)
-    print("email", email, flush=True)
+    logger.debug("Creating commit in repo_path: %s with message: %s", repo_path, message)
+    
+    if not repo_path or not message:
+        logger.warning("Both 'repo_path' and 'message' are required")
+        return jsonify({"error": "Both 'repo_path' and 'message' are required"}), 400
 
     if path not in REPOSITORIES:
+        logger.error("Repository path '%s' not found in registered repositories", path) 
         return jsonify({"error": f"Repository path '{path}' not found in registered repositories"}), 400
-
-    print("using path", path)
-
+    
     try:
         # Stage all changes
         #subprocess.run([GIT_EXECUTABLE, "add", "--all"], cwd=REPO_PATH, check=True)
@@ -659,6 +650,7 @@ def commit():
 
     except subprocess.CalledProcessError as e:
         # Handle Git command errors
+        logger.error("Git command failed: %s", e.stderr.decode().strip() if e.stderr else str(e))   
         return jsonify({
             "error": "Git command failed",
             "details": e.stderr.decode() if e.stderr else str(e)
@@ -666,12 +658,9 @@ def commit():
 
 @app.route('/api/status', methods=['POST'])
 def get_status():
-    print("/api/status", flush=True)
+    logger.info("API endpoint /api/status called")
     check_api_key()
-
     data = request.json
-
-    
     path = data.get('repo_path')
 
     try:
@@ -696,8 +685,7 @@ def get_status():
 
         for line in output:
             status_code = line[:2].strip()
-            print("status_code", status_code, flush=True)
-            print("line", line, flush=True)
+            logger.info("Processing line: %s", line)
             file_path = line[3:]
 
             parts = line.split(maxsplit=2)
@@ -707,8 +695,6 @@ def get_status():
 
             status_code = parts[0]
             file_path = parts[1]
-            print("status_code", status_code, flush=True)
-            print("file_path", file_path, flush=True)
 
             if status_code == "A":  # Added
                 status_summary["added"].append(file_path)
@@ -724,8 +710,6 @@ def get_status():
                 })
             elif status_code == "??":  # Untracked
                 status_summary["untracked"].append(file_path)
-
-        print("status_summary", status_summary, flush=True)
 
         # Generate action message with details about pending changes
         # has_pending_changes = any(status_summary[key] for key in status_summary)
@@ -760,6 +744,7 @@ def get_status():
         })
 
     except subprocess.CalledProcessError as e:
+        logger.error("Error running git status: %s", e.stderr.decode().strip() if e.stderr else str(e))
         return jsonify({
             "error": "An error occurred while running git status.",
             "details": str(e)
@@ -780,21 +765,20 @@ def get_status():
 
 @app.route('/api/pull/object', methods=['GET'])
 def pull_object():
-    print("/api/pull/object", flush=True)
-
+    logger.info("API endpoint /api/pull/object called")
     # Verify API key
     check_api_key()
-
     # Get the repository path from headers
     repo_path = request.headers.get('Repo-Path')
-    print("repo_path", repo_path, flush=True)
+    logger.debug("Received repo_path: %s", repo_path)
+
     if not repo_path:
-        print("Repository path is required", flush=True)
+        logger.error("'repo_path' is required")
         return jsonify({"error": "Repository path is required"}), 400
 
     # Validate repository
     if repo_path not in REPOSITORIES:
-        print(f"Repository path '{repo_path}' not found in registered repositories", flush=True)
+        logger.error("Repository path '%s' not found in registered repositories", repo_path)
         return jsonify({"error": f"Repository path '{repo_path}' not found in registered repositories"}), 400
 
     # Verify session ID
@@ -809,18 +793,20 @@ def pull_object():
 
     # Get the file path from the header
     file_path = request.headers.get('File-Path')
-    print("file_path", file_path, flush=True)
     if not file_path:
+        logger.error("File path is required")
         return jsonify({"error": "File path is required"}), 400
 
     object_file_path = os.path.join(repo_path, '.git/objects', file_path)
-    print("object_file_path", object_file_path, flush=True)
+    logger.debug("Resolved object_file_path: %s", object_file_path)
     if not os.path.isfile(object_file_path):
+        logger.error("The file '%s' does not exist on the server", file_path)   
         return jsonify({"error": f"The file '{file_path}' does not exist on the server"}), 404
 
     # Parse the Range header for partial content requests
     range_header = request.headers.get('Range')
     if not range_header:
+        logger.error("Range header is required")
         return jsonify({"error": "Range header is required"}), 400
 
     # Extract start and end bytes from the Range header
@@ -859,11 +845,11 @@ def pull_object():
         response.headers['Content-Range'] = f"bytes {start_byte}-{end_byte}/{file_size}"
         response.headers['Content-Length'] = str(chunk_size)
 
-        print(f"Serving bytes {start_byte}-{end_byte} of '{file_path}'", flush=True)
+        logger.debug("Serving bytes %d-%d of '%s'", start_byte, end_byte, file_path)
         return response
 
     except Exception as e:
-        print(f"Error reading object file: {e}", flush=True)
+        logger.error("Error reading object file: %s", str(e))
         return jsonify({"error": "Failed to read the object file"}), 500
 
 @app.route('/api/local-path', methods=['POST'])
@@ -871,10 +857,12 @@ def repo_path():
     """
     API to pull changes from remote
     """
+    logger.info("API endpoint /api/local-path called")
     check_api_key()
     try:
         return jsonify({"status": "success", "local_path": str(REPO_PATH)}), 200
     except Exception as e:
+        logger.error("Error retrieving local path: %s", str(e))
         return jsonify({"error": str(e)}), 500
 
 def extract_branch_from_error(error_message):
@@ -886,20 +874,21 @@ def extract_branch_from_error(error_message):
     return None
 
 def get_current_branch_or_default(repo_path):
-    print("get_current_branch_or_default", flush=True)
     """
     Returns the current branch name if the repository has commits.
     Otherwise, returns the default branch name to be used after the first commit.
     """
-   # First, check if there are any commits in the repository
+    logger.debug("Getting current branch or default for repo_path: %s", repo_path)
+    # First, check if there are any commits in the repository
     log_output = run_git_command(repo_path, [GIT_EXECUTABLE, "log", "-1"])  # This will throw an error if there are no commits
-    print("git log", log_output, flush=True)
+    logger.debug("git log output: %s", log_output)
 
     if "does not have any commits yet" in log_output:
         # Handle the case where the branch has no commits
-        print("processing first commit...", flush=True)
+        logger.info("processing first commit...")
         branch = extract_branch_from_error(log_output)
-        print("found branch", flush=True)
+        logger.debug("Found branch: %s", branch)
+        
         return {
             'status_message': f"Branch '{branch}' has no commits yet.",
             'branch': branch
@@ -913,15 +902,14 @@ def get_current_branch_or_default(repo_path):
 
 @app.route('/user/repos', methods=['POST'])
 def create_user_repos():
-    print("/user/repos", flush=True)
-
+    logger.info("API endpoint /user/repos called")
     check_api_key()
-
     # Get JSON payload
     data = request.get_json()
 
     # Validate the incoming JSON data
     if not data or 'name' not in data:
+        logger.error("Invalid input! Name is required.")
         return jsonify({'message': 'Invalid input! Name is required.'}), 400
 
     repo_name = data['name']
@@ -938,27 +926,23 @@ def create_user_repos():
         #with open(os.path.join(repo_path, 'README.md'), 'w') as readme_file:
         #    readme_file.write(f"# {repo_name}\n\n{repo_description}")
 
-        print("Repository created successfully!", flush=True)
+        logger.debug("New repository created at %s", repo_path)
         return jsonify({'message': 'Repository created successfully!', 'name': repo_name}), 201
 
     except subprocess.CalledProcessError:
-        print("Failed to create the repository", flush=True)
+        logger.error("Failed to create the repository")
         return jsonify({'message': 'Failed to create the repository!'}), 500
 
     except Exception as e:
-        print("Exception; repository create:", str(e), flush=True)
+        logger.error("Exception during repository creation: %s", str(e))
         return jsonify({'message': str(e)}), 500
 
 @app.route('/user/repos', methods=['GET'])
 def list_user_repos():
-    print("/user/repos", flush=True)
-
+    logger.info("API endpoint /user/repos called")
     check_api_key()
-
     auth_token = request.headers.get('Authorization')
-
-    print("auth_token", auth_token)
-
+    logger.debug("Authorization token: %s", auth_token)
     repositories = []
     index = 0
 
@@ -1024,13 +1008,12 @@ def list_repositories():
     """
     API to list repositories with their name, local path, status, branch, and remote URL.
     """
-
-    print("/api/repositories", flush=True)
+    logger.info("API endpoint /api/repositories called")
     check_api_key()
     try:
         repositories = []
         for repo_path in REPOSITORIES:
-            print("Processing repository ", repo_path, flush=True)
+            logger.debug("Checking repository at path: %s", repo_path)
             # Get the repository name and local path
             repo_name = os.path.basename(repo_path)
             local_path = repo_path
@@ -1087,6 +1070,7 @@ def list_repositories():
         return jsonify(response), 200
 
     except Exception as e:
+        logger.error("Error in /api/repositories: %s", str(e))
         print("An exception occured", str(e), flush=True)
         return jsonify({"error": str(e)}), 500
 
@@ -1103,7 +1087,7 @@ def list_directory_content(path, options, exclusion_patterns=None):
             if exclusion_patterns:
                 for pattern in exclusion_patterns:
                     if pattern in name:
-                        print(f"Excluding file based on pattern '{pattern}': {relative_path}")
+                        logger.debug(f"Excluding file based on pattern '{pattern}': {relative_path}")   
                         continue
 
             file_size = os.path.getsize(full_path)
@@ -1138,8 +1122,7 @@ def list_directory_content(path, options, exclusion_patterns=None):
 
 @app.route('/api/object/info', methods=['POST'])
 def get_object_info():
-
-    print("/api/object/info", flush=True)
+    logger.info("API endpoint /api/object/info called")
     check_api_key()
 
     data = request.json
@@ -1163,20 +1146,20 @@ def get_object_info():
         else:
             return jsonify({"error": "File does not exist"}), 404
     except Exception as e:
+        print("error exceptions", str(e))
         return jsonify({"error": str(e)}), 500
 
     return jsonify(file_info), 200
 
 @app.route('/api/objects', methods=['POST'])
 def list_object_files():
-
-    print("/api/objects", flush=True)
+    logger.info("API endpoint /api/objects called")
     check_api_key()
-    print("check api key ok", flush=True)
-
     data = request.json
     repo_path = data.get('repo_path')
+
     if repo_path not in REPOSITORIES:
+        logger.error("Repository path '%s' not found in registered repositories", repo_path)
         return jsonify({"error": f"Repository path '{repo_path}' not found in registered repositories"}), 400
 
     objects_path = repo_path+'/.git/objects'  # Update this to point to your repository's .git/objects
@@ -1185,14 +1168,14 @@ def list_object_files():
 
 @app.route('/api/refs', methods=['POST'])
 def list_git_refs():
-
-    print("/api/refs", flush=True)
+    logger.info("API endpoint /api/refs called")
     check_api_key()
 
     data = request.json
     repo_path = data.get('repo_path')
     print("repo_path", repo_path, flush=True)
     if repo_path not in REPOSITORIES:
+        logger.error("Repository path '%s' not found in registered repositories", repo_path)
         return jsonify({"error": f"Repository path '{repo_path}' not found in registered repositories"}), 400
 
     refs_path = repo_path+'/.git/refs'  # Update this to point to your repository's .git/refs
@@ -1212,15 +1195,17 @@ def download_file(data, sub_path):
 
     # Validate repository
     if repo_path not in REPOSITORIES:
+        logger.error("Repository path '%s' not found in registered repositories", repo_path)
         return jsonify({"error": f"Repository path '{repo_path}' not found in registered repositories"}), 400
 
     # Construct the path to the object or ref file
     object_path = os.path.join(repo_path, '.git', sub_path, relative_path)  # Include relative path
 
-    print("downloading object_path", object_path)
+    logger.debug("Downloading file from path: %s", object_path)
 
     # Read the specified object file
     if not os.path.isfile(object_path):
+        logger.error("File not found at path: %s", object_path)
         return jsonify({"error": f"File not found at '{object_path}'"}), 404
 
     try:
@@ -1231,6 +1216,7 @@ def download_file(data, sub_path):
             data = file.read(max_bytes) if max_bytes is not None else file.read()
 
             if not data:
+                logger.error("No data read from the specified offset")
                 return jsonify({"error": "No data read from the specified offset"}), 404
 
             # Return the raw bytes and the size
@@ -1238,21 +1224,20 @@ def download_file(data, sub_path):
             response.headers['Content-Length'] = str(len(data))
             return response
     except Exception as e:
-        print("error exceptions", str(e))
+        logger.error("Error reading file: %s", str(e))
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/download/object', methods=['POST'])
 def download_object():
-    print('/api/download/object', flush=True)
+    logger.info("API endpoint /api/download/object called")
     check_api_key()
     return download_file(request.json, 'objects')
 
 @app.route('/api/download/ref', methods=['POST'])
 def download_ref():
-    print('/api/download/ref', flush=True)
+    logger.info("API endpoint /api/download/ref called")
     check_api_key()
     return download_file(request.json, 'refs')
-
 
 ####################################
 #
@@ -1273,11 +1258,10 @@ def create_lock(lock_path, lock_content):
     try:
         with open(lock_path, 'w') as lock_file:
             json.dump(lock_content, lock_file)
-        print("Created lock for push", lock_path, flush=True)
+        logger.debug("Created lock for push at %s", lock_path)
         return True
     except Exception as e:
-        print("Failed to create lock for push", lock_path, flush=True)
-        print(f"Failed to create lock at {lock_path}: {e}")
+        logger.error("Failed to create lock for push at %s: %s", lock_path, str(e)) 
         return False
 
 def get_commit_hash(repo_path, ref):
@@ -1291,24 +1275,24 @@ def get_commit_hash(repo_path, ref):
 # API to initiate push and create locks
 @app.route('/api/push/start', methods=['POST'])
 def initiate_push():
-    print("/api/push/start", flush=True)
+    logger.info("API endpoint /api/push/start called")
     check_api_key()
     data = request.json
     repo_path = data.get('repo_path')
     branch = data.get('branch')
-    print("repo_path", repo_path)
-    print("branch", branch)
+    logger.debug("Push start for repo_path: %s, branch: %s", repo_path, branch)
+    
     client_id = data.get('client_id')  # Client ID or generate a random one
-    print("client_id", client_id)
+    logger.debug("Received client_id: %s", client_id)
     session_id = str(uuid.uuid4())  # Generate a unique session ID
-    print("session_id", session_id)
+    logger.debug("Generated session_id: %s", session_id)
 
     # Get the client head commit and remote commit
     client_head_commit = data.get('head_commit')
     client_remote_commit = data.get('remote_commit')
 
-    print("client_head_commit", client_head_commit, flush=True)
-    print("client_remote_commit", client_remote_commit, flush=True)
+    logger.debug("Received client_head_commit: %s", client_head_commit)
+    logger.debug("Received client_remote_commit: %s", client_remote_commit)
 
     lock_content = {
         "creation_time": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
@@ -1325,24 +1309,20 @@ def initiate_push():
     # Get the current branch HEAD commit
     local_head_commit = get_commit_hash(repo_path, f'.git/refs/heads/{branch}')
     new_branch = False
-    print("local_head_commit", local_head_commit)
+    logger.debug("Local head commit for branch '%s': %s", branch, local_head_commit)
     if local_head_commit is None:
-        print(f"Local branch '{branch}' does not exist, creating new branch.", flush=True)
-        #return jsonify({"error": f"Local branch '{branch}' does not exist."}), 404
+        logger.debug("Local branch '%s' does not exist, creating new branch.", branch)
     
     # Verify that the local head commit and client remote commit are the same
     elif client_remote_commit != local_head_commit:
+        logger.error("Local branch is out of date. Local head: %s, Client remote: %s", local_head_commit, client_remote_commit)
         return jsonify({"error": "Your local branch is out of date. Please pull the latest changes before pushing."}), 409
-
-        # Verify if the client is up to date
-        print(f"Client head commit: {client_remote_commit}, Local head commit: {local_head_commit}")
-        if client_head_commit == local_head_commit:
-            return jsonify({"error": "Already up to date. Nothing to pull."}), 409
     else:
         lock_content['local_head_commit'] = local_head_commit
 
     # Validate the repository
     if repo_path not in REPOSITORIES:
+        logger.error("Repository path '%s' not found in registered repositories", repo_path)
         return jsonify({"error": f"Repository '{repo_name}' not found"}), 400
 
     # Define lock paths
@@ -1351,6 +1331,7 @@ def initiate_push():
 
     # Check for existing locks
     if lock_exists(local_lock_path) or lock_exists(remote_lock_path):
+        logger.error("A push is already in progress. Lock file exists.")
         return jsonify({"error": "A push is already in progress. Lock file exists."}), 409
 
     # Create local lock (if local refs exist)
@@ -1360,6 +1341,7 @@ def initiate_push():
     if os.path.exists(local_heads_path):
         lock_content['local_heads_path'] = local_heads_path
         if not create_lock(local_lock_path, lock_content):
+            logger.error("Failed to create local lock at %s", local_lock_path)
             return jsonify({"error": "Failed to create local lock"}), 500
 
     # Create remote lock (if remote refs exist)
@@ -1368,9 +1350,10 @@ def initiate_push():
     if os.path.exists(remote_heads_path):
         lock_content['remote_heads_path'] = remote_heads_path
         if not create_lock(remote_lock_path, lock_content):
+            logger.error("Failed to create remote lock at %s", remote_lock_path)
             return jsonify({"error": "Failed to create remote lock"}), 500
 
-    print("Initiated push with session id;", session_id)
+    logger.debug("Initiated push with session id: %s", session_id)
     # Return session ID to be used for future push operations
     return jsonify({
         "message": "Push initiated successfully",
@@ -1384,7 +1367,7 @@ def validate_lock(lock_path, session_id):
             lock_content = json.load(lock_file)
             return lock_content.get('session_id') == session_id
     except Exception as e:
-        print(f"Failed to validate lock at {lock_path}: {e}")
+        logger.error("Failed to validate lock at %s: %s", lock_path, str(e))
         return False
 
 # Helper function to remove the lock file
@@ -1392,11 +1375,11 @@ def remove_lock(lock_path):
     try:
         if os.path.exists(lock_path):
             os.remove(lock_path)
-            print(f"Removed lock at {lock_path}", flush=True)
+            logger.debug("Removed lock at %s", lock_path)
             return True
         return False
     except Exception as e:
-        print(f"Failed to remove lock at {lock_path}: {e}", flush=True)
+        logger.error("Failed to remove lock at %s: %s", lock_path, str(e))
         return False
 
 def is_bare_repository(repo_path):
@@ -1411,10 +1394,11 @@ def reset_branch(repo_path, branch):
 
     Returns a JSON response indicating success or failure.
     """
-    print("reset_branch", flush=True)
+    logger.debug("Resetting branch '%s' in repository at path: %s", branch, repo_path)
     # Check if the repository is bare or non-bare
 
     if is_bare_repository(repo_path):
+        logger.debug("Repository is bare, no reset needed.")
         return {"message": "No need to reset bare repository."}, 200
 
     git_dir = os.path.join(repo_path, ".git")
@@ -1422,7 +1406,7 @@ def reset_branch(repo_path, branch):
     # If non-bare, check if the branch is the current branch in the working directory
     head_file_path = os.path.join(git_dir, "HEAD")
     if not os.path.exists(head_file_path):
-        print("HEAD file not found", flush=True)
+        logger.error("HEAD file not found in non-bare repository at %s", git_dir)
         return {"error": "HEAD file not found, unable to reset"}, 404
 
     # Determine the current branch (if not bare)
@@ -1432,48 +1416,50 @@ def reset_branch(repo_path, branch):
     # Example format of HEAD: "ref: refs/heads/master"
     if head_content.startswith("ref: "):
         current_branch = head_content.split("/")[-1]  # Extract branch name from HEAD
-        print(f"Current branch: {current_branch}", flush=True)
+        logger.debug("Current branch: %s", current_branch)
     else:
         current_branch = None
-        print(f"HEAD is detached, current commit is {head_content}", flush=True)
+        logger.debug(f"HEAD is detached, current commit is {head_content}")
 
     # Only reset if this is a non-bare repo and the branch matches the current branch
     if current_branch and branch == current_branch:
         try:
-            print(f"Resetting branch {branch} in non-bare repository at {repo_path} to match the latest pushed commit.", flush=True)
-
+            logger.debug("Resetting branch '%s' in non-bare repository at %s to match the latest pushed commit.", branch, repo_path)
+            
             # Perform git reset --hard using the git binary
             result = subprocess.run(['git', 'reset', '--hard'], cwd=repo_path, capture_output=True, text=True)
 
             if result.returncode != 0:
-                print(f"Error during git reset --hard: {result.stderr}", flush=True)
+                logger.error(f"Error during git reset --hard: {result.stderr}")
                 return {"error": f"Failed to reset branch: {result.stderr}"}, 500
 
-            print(f"Branch {branch} successfully reset --hard.", flush=True)
+            logger.debug(f"Branch {branch} successfully reset --hard.")
             return {"message": f"Push completed. Branch {branch} reset --hard to the latest commit."}, 200
 
         except Exception as e:
-            print(f"Exception during git reset --hard: {e}")
+            logger.error(f"Exception during git reset --hard: {str(e)}")
             return {"error": f"Failed to reset branch: {str(e)}"}, 500
 
     else:
         # No reset needed (bare repo or branch does not match current branch)
-        print(f"Push No reset performed (requested branch {branch} not checked out).")
+        logger.debug(f"No reset needed (bare repo or branch {branch} not checked out).")
         return {"message": "Push No reset performed (requested branch {branch} not checked out)."}, 200
 
 
 # API to stop push and remove locks
 @app.route('/api/push/end', methods=['POST'])
 def stop_push():
-    print("/api/push/end", flush=True)
+    logger.info("API endpoint /api/push/end called")
     check_api_key()
     data = request.json
     repo_path = data.get('repo_path')
     session_id = data.get('session_id')  # Session ID to validate
     branch = data.get('branch')
+    logger.debug("Processing push end for repo_path: %s, branch: %s, session_id: %s", repo_path, branch, session_id)
 
     # Validate the repository
     if repo_path not in REPOSITORIES:
+        logger.warning("Repository '%s' not found", repo_path)
         return jsonify({"error": f"Repository '{repo_path}' not found"}), 400
 
     # Define lock paths
@@ -1484,18 +1470,18 @@ def stop_push():
 
     if lock_exists(local_lock_path):
         if not validate_lock(local_lock_path, session_id):
-            print(f"error: Invalid session ID {session_id} for local lock")
+            logger.warning("Invalid session for local lock: %s", error_message)
             return jsonify({"error": "Invalid session ID for local lock"}), 403
 
     # Validate and remove the remote lock if it exists
     if lock_exists(remote_lock_path):
         if not validate_lock(remote_lock_path, session_id):
-            print(f"error: Invalid session ID {session_id} for remote lock")
+            logger.warning("Invalid session for remote lock: %s", error_message)
             return jsonify({"error": "Invalid session ID for remote lock"}), 403
 
     
     workdir_branch = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "branch", "--show-current"])
-    print("workdir_branch", workdir_branch, flush=True)
+    logger.debug("Current workdir branch: %s", workdir_branch)
 
     # Define the paths
     head_path = os.path.join(repo_path, '.git', 'HEAD')
@@ -1503,90 +1489,37 @@ def stop_push():
     # Check if .git/HEAD exists
     if not os.path.exists(head_path):
         # Create .git/HEAD and write the reference to the specified branch
+        logger.info("Creating .git/HEAD for branch: %s", branch)
         branch_ref = f"ref: refs/heads/{branch}\n"
         with open(head_path, 'w') as head_file:
             head_file.write(branch_ref)
-        print(f"Created .git/HEAD pointing to branch '{branch}'")
+        logger.info("Created .git/HEAD for branch: %s", branch)
     else:
-        print(".git/HEAD already exists")
+        logger.info(".git/HEAD already exists")
 
     if lock_exists(local_lock_path):
         if not remove_lock(local_lock_path):
-            print(f"error: Failed to remove local lock file {local_lock_path}")
+            logger.error(f"error: Failed to remove local lock file {local_lock_path}")
             return jsonify({"error": "Failed to remove local lock"}), 500
-    
-
-def hello():
-    print("my life is beautifull");
-
-
-    checkout = None
-    reset_response = None
-    if workdir_branch != branch:
-        # git checkout branch
-        if workdir_branch:
-            print(f"checking out target branch in workdir {workdir_branch}->{branch}", flush=True)
-        else:
-            print("checking out workdir to branch {branch}", flush=True)
-        checkout = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "checkout", branch])
-        print("checkout", checkout, flush=True)
-        if checkout.startswith("Error"):
-            print("found error in checkout:", checkout)
-            return jsonify({
-                "checkout_message": checkout,
-                "message": "Checkout error:" + checkout,
-                "session_id": session_id,
-                "Checkout error": checkout
-            }), 500
-    else:
-        # Attempt to reset the branch if needed
-        reset_response, reset_status = reset_branch(repo_path, branch)
-
-        # If there's an error from resetting the branch, include it in the final response
-        if reset_status != 200:
-            return jsonify({
-                "message": "Push completed with reset errors.",
-                "session_id": session_id,
-                "reset_error": reset_response["error"]
-            }), reset_status
-
-    # If both locks are removed successfully
-
-    if not remove_lock(remote_lock_path):
-        print(f"error: Failed to remove remote lock file {remote_lock_path}")
-        return jsonify({"error": "Failed to remove remote lock"}), 500
-    
-    reset_message = reset_response.get("message") if reset_response else "No reset message"
-    print("Push completed and locks removed successfully for repo {repo_path} session id {session_id}", flush=True)
-    return jsonify({
-        "message": "Push completed and locks removed successfully",
-        "session_id": session_id,
-        "reset_message": reset_message,
-        "checkout_message": checkout
-    }), 200
-
-
 
 @app.route('/api/push/object', methods=['POST'])
 def push_object():
-    print("/api/push/object", flush=True)
-
+    logger.info("API endpoint /api/push/object called")
     # Verify API key
     check_api_key()
-
-    #print("headers", request.headers)
-
     repo_path = request.headers.get('Repo-Path')
-    print("repo_path", repo_path, flush=True)
+    logger.debug("Processing push object for repo_path: %s", repo_path)
 
     # Validate repository
     if repo_path not in REPOSITORIES:
+        logger.warning("Repository path '%s' not found in registered repositories", repo_path)
         return jsonify({"error": f"Repository path '{repo_path}' not found in registered repositories"}), 400
 
     # Verify session ID
     session_id = request.headers.get('Session-ID')
     print("session_id", session_id, flush=True)
     if not session_id:
+        logger.warning("Session ID is required")
         return jsonify({"error": "Session ID is required"}), 400
 
     # Define lock paths
@@ -1595,32 +1528,30 @@ def push_object():
     # Check for existing locks
     if not lock_exists(local_lock_path):
         # Return error message if the lock for a valid push session is missing
-        print(f"Missing lock for valid push session on {local_lock_path}.", flush=True)
+        logger.warning("Missing lock for valid push session on %s", local_lock_path)
         return jsonify({"error": f"Missing lock for valid push session on {local_lock_path}."}), 404
-    print("found session lock file")
+
     if not validate_lock(local_lock_path, session_id):
-        print(f"error: Invalid session ID {session_id} for local lock", flush=True)
+        logger.warning("Invalid session ID %s for local lock", session_id)
         return jsonify({"error": "Invalid session ID for local lock"}), 403
-    print("session is valid", flush=True)
+    
     # Get the file path from the header
     file_path = request.headers.get('File-Path')
     
     if not file_path:
-        print("File path is required", flush=True)
+        logger.warning("File path is required")
         return jsonify({"error": "File path is required"}), 400
-    print("file_path", file_path, flush=True)
+    
     # Get the upload mode from the header
     upload_mode = request.headers.get('Upload-Mode', 'full')  # Default to 'full' if not provided
-    print("Upload mode:", upload_mode, flush=True)
+    logger.debug("Upload mode: %s", upload_mode)
 
     # Read the binary data from the request
     binary_data = request.data
 
     # Save the object to a file
     object_file_path = os.path.join(repo_path, '.git/objects', file_path)
-
-    print("Recieving file path", object_file_path, flush=True)
-    #return jsonify({"message": "Object pushed successfully", "file_path": object_file_path}), 200
+    logger.debug("Receiving file path: %s", object_file_path)
 
     try:
         # Create the directory if it doesn't exist
@@ -1631,83 +1562,78 @@ def push_object():
             # Create or overwrite the file for the initial chunk
             with open(object_file_path, 'wb') as obj_file:
                 obj_file.write(binary_data)
-            print(f"File started: {object_file_path}", flush=True)
+            logger.info("File started: %s", object_file_path)
 
         elif upload_mode == 'append':
             # Append to the file for subsequent chunks
             with open(object_file_path, 'ab') as obj_file:
                 obj_file.write(binary_data)
-            print(f"Data appended to: {object_file_path}", flush=True)
+            logger.info("Data appended to: %s", object_file_path)
 
         elif upload_mode == 'full':
             # Write the full file in one go
             with open(object_file_path, 'wb') as obj_file:
                 obj_file.write(binary_data)
-            print(f"Full file uploaded: {object_file_path}", flush=True)
+            logger.info("Full file uploaded: %s", object_file_path)
 
         else:
-            print("Invalid upload mode specified", flush=True)
+            logger.warning("Invalid upload mode specified: %s", upload_mode)
             return jsonify({"error": "Invalid upload mode specified"}), 400
 
-        print("Object pushed successfully", "file_path:", object_file_path, flush=True)
+        logger.info("Object pushed successfully: %s", object_file_path)
         return jsonify({"message": "Object pushed successfully", "file_path": object_file_path}), 200
 
     except Exception as e:
-        print(f"Error saving object: {e}")
+        logger.error("Failed to save object %s: %s", object_file_path, str(e))
         return jsonify({"error": "Failed to save the object"}), 500
 
 @app.route('/api/push/ref', methods=['POST'])
 def update_ref():
-    print("/api/push/ref", flush=True)
+    logger.info("API endpoint /api/push/ref called")
     check_api_key()
-
     # Get data from request
     data = request.json
     commit_id = data.get('commit_id')  # The commit ID to set
     repo_path = data.get('repo_path')   # The repository path
     session_id = data.get('session_id')  # Validate the session ID
     branch = data.get('branch')
-    print("branch", branch, flush=True)
+    logger.debug("Updating ref for repo_path: %s, branch: %s, commit_id: %s", repo_path, branch, commit_id)
+
     # Validate session
     # Define lock paths
     local_lock_path = os.path.join(repo_path, '.git/refs/remotes/push.lock')
     is_valid, error_message = validate_session(local_lock_path, session_id)
     if not is_valid:
-        print(f"error: {error_message}", flush=True)
+        logger.warning("Invalid session: %s", error_message)
         return jsonify({"error": error_message}), 403 if "Invalid session" in error_message else 404
 
     # Define the path to heads/master
     heads_master_path = os.path.join(repo_path, f'.git/refs/heads/{branch}')
-    print("heads_master_path", heads_master_path, flush=True)
+    logger.debug("Heads master path: %s", heads_master_path)
+
     # Extract the directory portion of the path (exclude the file)
     directory = os.path.dirname(heads_master_path)
-    print("directory", directory, flush=True)
+    
     # Check if the directory exists, and if not, create it
     if not os.path.exists(directory):
-        print("Directory not found, creating new branch ref directory {directory}...", flush=True)
+        logger.info("Creating branch ref directory: %s", directory)
         os.makedirs(directory)  # This will create all necessary parent di
-
-    # Check if the heads/master file exists
-    if not os.path.exists(heads_master_path):
-        print(f"heads/{branch} not found, creating new branch ref", flush=True)
-        #return jsonify({"error": "heads/master not found"}), 404
 
     # Update heads/master with the new commit ID
     current_commit_id = None
     try:
         # Read the current commit ID from heads/{branch}
         if os.path.exists(heads_master_path):
-            print("Reading heads/master", flush=True)
+            logger.debug("Reading heads/%s", branch)
             with open(heads_master_path, 'r') as f:
                 current_commit_id = f.read().strip()
 
             # Check if the current commit ID is already up to date
             if current_commit_id == commit_id:
-                print(f"{branch} is already up to date with commit {commit_id}")
+                logger.info("%s is already up to date with commit %s", branch, commit_id)
                 return jsonify({"message": f"{branch} is already up to date", "commit_id": commit_id}), 200
 
-        print("writeing to head path:", heads_master_path, flush=True)
-        print("commit id", commit_id, flush=True)
+        logger.debug("Writing to heads/%s with commit_id: %s", branch, commit_id)
         with open(heads_master_path, 'w') as f:
             f.write(commit_id + '\n')
         
@@ -1717,24 +1643,27 @@ def update_ref():
             "to_commit_id": commit_id
         }
         if current_commit_id:
-            print(f"Updated {branch} from {current_commit_id} to {commit_id}", flush=True)
+            logger.info("Updated %s from %s to %s", branch, current_commit_id, commit_id)
             result["message"] = f"Reference updated successfully for {branch} from {current_commit_id} to {commit_id}"
         else:
-            print(f"Created new branch ref {branch} set to commit {commit_id}", flush=True)
+            logger.info("Created new branch ref %s set to commit %s", branch, commit_id)
             result["message"] = f"Created new branch successfully for {branch} set to {commit_id}"
 
         return jsonify(result), 200
 
     except Exception as e:
-        print(f"Error updating heads/master: {e}")
+        logger.error("Failed to update reference for %s: %s", branch, str(e))
         return jsonify({"error": "Failed to update reference"}), 500
 
 # Ensure to add the necessary logic to verify API keys and maintain your repository list
 
 # Main entry point for running the server
 if __name__ == '__main__':
-    print("CERT_PATH", CERT_PATH, flush=True)
-    print("KEY_PATH", KEY_PATH, flush=True)
-    app.run(ssl_context=(CERT_PATH, KEY_PATH), host='0.0.0.0', port=5001)
+    logger.info("Starting StarBridge server")
+    if SSL_MODE and SSL_MODE == 'adhoc':
+        logger.warning("Starting server in adhoc SSL mode")
+        app.run(ssl_context='adhoc', host='0.0.0.0', port=5001)
+    else:
+        app.run(ssl_context=(CERT_PATH, KEY_PATH), host='0.0.0.0', port=5001)
 
-print("StarBridge online", flush=True)
+logger.info("StarBridge server online")
