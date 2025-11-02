@@ -16,6 +16,8 @@ from logging.handlers import RotatingFileHandler
 import threading
 import psutil
 from datetime import datetime, timedelta
+import mimetypes
+import base64 
 
 # Configure logging
 logging.basicConfig(
@@ -50,6 +52,7 @@ STARGIT_API_URL = os.getenv('STARGIT_API_URL', 'https://stargit.com')
 AUTH_ENDPOINT = f"{STARGIT_API_URL}/api/auth/token"
 REGISTER_ENDPOINT = f"{STARGIT_API_URL}/api/servers/register"
 HEARTBEAT_ENDPOINT = f"{STARGIT_API_URL}/api/servers/heartbeat"
+POLL_ENDPOINT = f"{STARGIT_API_URL}/api/servers/poll"
 
 # Add this near the top, after loading env
 PUSH_MODE = os.getenv('PUSH_MODE', 'false').lower() == 'true'
@@ -63,7 +66,7 @@ tokens = {
     'access_token': None,
     'refresh_token': None,
     'expires_at': None,
-    'api_key_uuid': None  # Store APIKey.uuid as server_id
+    'api_key_uuid': None  # Store APIKey.uuid as server_uuid
 }
 
 SSL_MODE = os.getenv('SSL_MODE', 'none').lower()
@@ -1819,7 +1822,7 @@ def get_access_token():
             "Content-Type": "application/json"
         }
         payload = {
-            "scopes": "servers:register servers:heartbeat"
+            "scopes": "servers:register servers:heartbeat servers:poll"
             # No metadata in initial request
         }
         response = requests.post(AUTH_ENDPOINT, json=payload, headers=headers)
@@ -1838,7 +1841,75 @@ def get_access_token():
         logger.error("Error fetching token from %s: %s (key: %s...)", AUTH_ENDPOINT, str(e), STARGIT_API_KEY[:8])
         return None
 
-# Add this new function to collect detailed repository information
+# Existing run_git_command function (from your code)
+def run_git_command(path, command):
+    """Utility function to run a git command and return the output."""
+    logger.debug("Running git command: %s in path: %s", command, path)
+    try:
+        result = subprocess.run(command, cwd=path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        logger.debug("Git command output: %s", result.stdout.strip())
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        logger.error("Git command error: %s", e.stderr.strip())
+        return f"Error: {e.stderr.strip()}"
+
+import concurrent.futures
+
+def get_file_list(repo_path):
+    """Get a list of committed files with metadata: name, latest_sha, size."""
+    # Single command for all files: mode type blob_sha size path
+    command = [GIT_EXECUTABLE, "-C", repo_path, "ls-tree", "-r", "-l", "HEAD"]
+    output = run_git_command(repo_path, command)
+    if output.startswith("Error:"):
+        logger.warning("Failed to get file list for repo %s", repo_path)
+        return [], 0
+    
+    file_info = []
+    total_size = 0
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split(maxsplit=4)  # mode, type, blob_sha, size, path (handle spaces in paths)
+        if len(parts) == 5:
+            mode, obj_type, blob_sha, size_str, file_path = parts
+            if obj_type == 'blob':  # Only files, skip trees
+                file_size = int(size_str) if size_str.isdigit() else 0
+                total_size += file_size
+                file_info.append({
+                    "name": file_path.strip(),
+                    "blob_sha": blob_sha,  # Not latest commit SHA, but blob SHA (if needed)
+                    "size": file_size
+                })
+    
+    # Parallelize latest commit SHA per file
+    def get_latest_sha(file_path):
+        command_sha = [GIT_EXECUTABLE, "-C", repo_path, "log", "-1", "--format=%H", "--", file_path]
+        latest_sha = run_git_command(repo_path, command_sha)
+        return latest_sha if not latest_sha.startswith("Error:") else None
+    
+    file_paths = [f["name"] for f in file_info]
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        shas = list(executor.map(get_latest_sha, file_paths))
+    
+    for info, sha in zip(file_info, shas):
+        info["latest_sha"] = sha
+    
+    return file_info, total_size
+
+def get_readme_text(repo_path):
+    """Read and serialize README.md text if it exists."""
+    readme_path = os.path.join(repo_path, "README.md")
+    if os.path.exists(readme_path):
+        try:
+            with open(readme_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except Exception as e:
+            logger.error("Error reading README.md in %s: %s", repo_path, str(e))
+            return ""
+    logger.debug("No README.md found in %s", repo_path)
+    return ""
+
+# Updated collect_repo_details
 def collect_repo_details():
     """
     Collect detailed information about all local repositories, including branches, status, remotes, and commits.
@@ -1860,7 +1931,7 @@ def collect_repo_details():
             repo["status"] = {"error": status_error["message"]}
         else:
             repo["status"] = status_data
-
+        
         # Get remotes
         remotes_info = []
         remotes_output = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "remote", "-v"])
@@ -1875,9 +1946,8 @@ def collect_repo_details():
                         remotes_info.append({"name": name, "type": typ, "url": url})
                         seen.add(key)
         repo["remotes"] = remotes_info
-        
         print("repo['remotes']", repo["remotes"], flush=True)
-
+        
         branches, branches_error = get_branches_data(repo_path)
         if branches_error:
             print("Failed to get branches:", branches_error)
@@ -1885,10 +1955,10 @@ def collect_repo_details():
         else:
             print("Branches data:", branches)
             repo["branches"] = branches
-
+        
         # Get commits (using rev_walk logic)
         command = [GIT_EXECUTABLE, "-C", repo_path, "log", "--date=iso", "--pretty=format:%H|%P|%an|%ae|%ad|%s", repo["branch"]]
-        process = subprocess.Popen(command, stdout=PIPE, stderr=PIPE)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = process.communicate()
         commits = []
         if process.returncode == 0:
@@ -1912,6 +1982,14 @@ def collect_repo_details():
             logger.warning("Failed to fetch commits for repo %s: %s", repo_name, stderr.decode('utf-8'))
         repo["commits"] = commits
         
+        # Add files list and total size
+        files, total_size = get_file_list(repo_path)
+        repo["files"] = files
+        repo["storage_size"] = total_size
+        
+        # Add README text
+        repo["readme"] = get_readme_text(repo_path)
+        
         servers["repos"].append(repo)
     
     return servers
@@ -1932,7 +2010,7 @@ def register_with_stargit(event_type='heartbeat'):
     try:
         metrics = collect_server_metrics() if event_type == 'heartbeat' else {}
         payload = {
-            "server_id": tokens['api_key_uuid'],
+            "server_uuid": tokens['api_key_uuid'],
             "event_type": event_type,
             "status": "online",
             "metrics": metrics,
@@ -1986,9 +2064,126 @@ def registration_thread():
             register_with_stargit(event_type='heartbeat')  # Periodic heartbeat
             time.sleep(300)  # 5 minutes
 
+# Binary-safe file fetch (git show returns bytes)
+def get_file_content(repo_path, file_path, ref='HEAD'):
+    command = [GIT_EXECUTABLE, "-C", repo_path, "show", f"{ref}:{file_path}"]
+    try:
+        result = subprocess.run(command, cwd=repo_path, capture_output=True, text=False, timeout=30)
+        if result.returncode == 0:
+            content = result.stdout  # bytes
+            mime, _ = mimetypes.guess_type(file_path)
+            if mime and mime.startswith('text/'):
+                try:
+                    content_str = content.decode('utf-8')
+                    return {"content": content_str, "is_base64": False, "mime_type": mime}, None
+                except UnicodeDecodeError:
+                    # Fallback to base64 if decoding fails
+                    return {"content": base64.b64encode(content).decode('ascii'), "is_base64": True, "mime_type": mime}, None
+            else:
+                # Binary: always base64
+                return {"content": base64.b64encode(content).decode('ascii'), "is_base64": True, "mime_type": mime}, None
+        else:
+            return None, result.stderr.decode('utf-8', errors='ignore')
+    except Exception as e:
+        return None, str(e)
+
+# Find repo path by name (assuming REPOSITORIES is list of paths)
+def find_repo_path(repo_name):
+    for path in REPOSITORIES:
+        if os.path.basename(path) == repo_name:
+            return path
+    return None
+
+# Process tasks from poll response
+def process_tasks(tasks):
+    logger.debug(f"Processing {len(tasks)} tasks")
+    results = []
+    for task in tasks:
+        logger.debug(f"Task details: {task}")
+        if task.get('action') == 'get_file':  # Updated to 'action' (from your model)
+            params = task.get('params', {})
+            repo_name = params.get('repo_name')
+            file_path = params.get('file_path')
+            commit_sha = params.get('commit_sha', 'HEAD')
+            logger.debug(f"get_file params: repo={repo_name}, path={file_path}, sha={commit_sha}")
+            repo_path = find_repo_path(repo_name)
+            if not repo_path:
+                logger.warning(f"Repo {repo_name} not found")
+                results.append({"task_id": task['id'], "result": None, "error": f"Repo {repo_name} not found"})
+                continue
+            content_data, error = get_file_content(repo_path, file_path, commit_sha)
+            if error:
+                logger.error(f"get_file error: {error}")
+                results.append({"task_id": task['id'], "result": None, "error": error})
+            else:
+                logger.debug(f"get_file success: {content_data}")
+                results.append({"task_id": task['id'], "result": content_data, "error": None})
+        else:
+            logger.warning(f"Unknown action: {task.get('action')}")
+            results.append({"task_id": task['id'], "result": None, "error": f"Unknown action: {task.get('action')}"})
+    logger.debug(f"Processed results: {results}")
+    return results
+
+# Poll function (reuses your access_token logic)
+def poll_for_tasks(results=None):
+    logger.debug("Polling for tasks")
+    if not STARGIT_API_KEY:
+        return []
+    access_token = get_access_token()
+    if not access_token or not tokens['api_key_uuid']:
+        logger.error("No valid access token for poll")
+        return []
+    payload = {
+        "server_uuid": tokens['api_key_uuid'],
+        "event_type": "poll",
+        "timestamp": time.time(),
+        "results": results or []
+    }
+    logger.debug(f"Sending payload: {payload}")
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    endpoint = POLL_ENDPOINT
+    try:
+        response = requests.post(endpoint, json=payload, headers=headers)
+        logger.debug(f"Response status: {response.status_code}, body: {response.text}")
+        if response.status_code == 200:
+            data = response.json()
+            tasks = data.get('tasks', [])
+            logger.debug(f"Received {len(tasks)} tasks: {tasks}")
+            return tasks
+        elif response.status_code == 401:
+            logger.warning("Token invalid; refreshing")
+            tokens['access_token'] = None
+            access_token = get_access_token()
+            if access_token:
+                headers["Authorization"] = f"Bearer {access_token}"
+                response = requests.post(endpoint, json=payload, headers=headers)
+                logger.debug(f"Retry status: {response.status_code}, body: {response.text}")
+                if response.status_code == 200:
+                    data = response.json()
+                    tasks = data.get('tasks', [])
+                    logger.debug(f"Received {len(tasks)} tasks after retry: {tasks}")
+                    return tasks
+        logger.error(f"Poll failed: {response.text} (status: {response.status_code})")
+        return []
+    except Exception as e:
+        logger.error(f"Error during poll: {str(e)}")
+        return []
+    
+# Poll thread (separate from registration_thread for different interval)
+def poll_thread():
+    results = []  # Start with empty
+    while True:
+        tasks = poll_for_tasks(results)
+        results = process_tasks(tasks)
+        time.sleep(5)  # Every 5 seconds; adjust via env var if needed
+
 # Start registration thread
 if STARGIT_API_KEY:
     threading.Thread(target=registration_thread, daemon=True).start()
+    threading.Thread(target=poll_thread, daemon=True).start()
 
 # Main entry point for running the server
 if __name__ == '__main__':
