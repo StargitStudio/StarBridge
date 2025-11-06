@@ -2098,6 +2098,7 @@ def compute_other_deltas(repo_path, branch, last_head, current_head):
                     })
                     seen.add(key)
     deltas['remotes'] = {"remotes": remotes_info}  # Match structure if needed, or just list
+    # deltas['remotes'] = remotes_info # simpler structure MAYBE TBD !!!! TODO INVESTICGATE
     # Files (full ls-tree if changed)
     files, total_size = get_file_list(repo_path)
     deltas['files'] = files
@@ -2246,11 +2247,6 @@ def send_heartbeat_to_stargit(batch_mode=False):
     summaries = collect_repo_summaries()
     metrics = collect_server_metrics()
 
-    print("----------------------", flush=True)
-    print("----------------------", flush=True)
-    print("----------------------", flush=True)
-    print("----------------------", flush=True)
-    print("!!!!! metrics:", metrics, flush=True)
     payload = {**base_payload, "mode": "probe", "metrics": metrics, "repo_summaries": summaries}
     response = post_with_retry(HEARTBEAT_ENDPOINT, payload, headers, timeout=10)
 
@@ -2397,23 +2393,62 @@ def find_repo_path(repo_name):
             return path
     return None
 
-# Process tasks from poll response
+# Get file commit history
+def get_file_history(repo_path, file_path, ref='HEAD'):
+    """Get commit history for a file: list of commits that modified it, with basic info and changes."""
+    command = [GIT_EXECUTABLE, "-C", repo_path, "log", "--pretty=format:%H|%an|%ae|%ad|%s", "--date=iso", "--numstat", ref, "--", file_path]
+    output = run_git_command(repo_path, command)
+    if output.startswith("Error:"):
+        logger.warning("Failed to get file history for %s in %s", file_path, repo_path)
+        return None
+    history = []
+    current_commit = None
+    for line in output.splitlines():
+        if line.strip():
+            if '|' in line:  # Commit line
+                if current_commit:
+                    history.append(current_commit)
+                parts = line.split('|', 4)
+                if len(parts) == 5:
+                    sha, author_name, author_email, date, message = parts
+                    current_commit = {
+                        "sha": sha,
+                        "author_name": author_name,
+                        "author_email": author_email,
+                        "date": date,
+                        "message": message,
+                        "changes": {"additions": 0, "deletions": 0}  # Aggregate numstat
+                    }
+            elif current_commit and '\t' in line:  # Numstat line: additions\tdeletions\tpath
+                parts = line.split('\t')
+                if len(parts) == 3:
+                    add, del_, path = parts
+                    if add.isdigit() and del_.isdigit():
+                        current_commit["changes"]["additions"] += int(add)
+                        current_commit["changes"]["deletions"] += int(del_)
+    if current_commit:
+        history.append(current_commit)
+    return history
+
+# Process tasks from poll response - handles 'get_file' and 'get_file_history' actions
 def process_tasks(tasks):
     logger.debug(f"Processing {len(tasks)} tasks")
     results = []
     for task in tasks:
         logger.debug(f"Task details: {task}")
-        if task.get('action') == 'get_file':  # Updated to 'action' (from your model)
-            params = task.get('params', {})
-            repo_name = params.get('repo_name')
+        action = task.get('action')
+        params = task.get('params', {})
+        repo_name = params.get('repo_name')
+        repo_path = find_repo_path_by_name(repo_name)
+        if not repo_path:
+            logger.warning(f"Repo {repo_name} not found")
+            results.append({"task_id": task['id'], "result": None, "error": f"Repo {repo_name} not found"})
+            continue
+        
+        if action == 'get_file':
             file_path = params.get('file_path')
             commit_sha = params.get('commit_sha', 'HEAD')
             logger.debug(f"get_file params: repo={repo_name}, path={file_path}, sha={commit_sha}")
-            repo_path = find_repo_path(repo_name)
-            if not repo_path:
-                logger.warning(f"Repo {repo_name} not found")
-                results.append({"task_id": task['id'], "result": None, "error": f"Repo {repo_name} not found"})
-                continue
             content_data, error = get_file_content(repo_path, file_path, commit_sha)
             if error:
                 logger.error(f"get_file error: {error}")
@@ -2421,9 +2456,21 @@ def process_tasks(tasks):
             else:
                 logger.debug(f"get_file success: {content_data}")
                 results.append({"task_id": task['id'], "result": content_data, "error": None})
+        
+        elif action == 'get_file_history':
+            file_path = params.get('file_path')
+            commit_sha = params.get('commit_sha', 'HEAD')
+            logger.debug(f"get_file_history params: repo={repo_name}, path={file_path}, sha={commit_sha}")
+            history = get_file_history(repo_path, file_path, commit_sha)
+            if history is None:
+                results.append({"task_id": task['id'], "result": None, "error": "Failed to fetch history"})
+            else:
+                results.append({"task_id": task['id'], "result": {"history": history}, "error": None})
+        
         else:
-            logger.warning(f"Unknown action: {task.get('action')}")
-            results.append({"task_id": task['id'], "result": None, "error": f"Unknown action: {task.get('action')}"})
+            logger.warning(f"Unknown action: {action}")
+            results.append({"task_id": task['id'], "result": None, "error": f"Unknown action: {action}"})
+    
     logger.debug(f"Processed results: {results}")
     return results
 
