@@ -2450,10 +2450,12 @@ def get_commit_diff(repo_path, commit_sha):
                 status = parts[0]
                 if status.startswith('R'):
                     old_file, new_file = parts[1], parts[2]
-                    changed_files.append({'old_filename': old_file, 'filename': new_file, 'status': 'renamed', 'additions': 0, 'deletions': 0, 'binary': False, 'old_content': None, 'new_content': None})
+                    #changed_files.append({'old_filename': old_file, 'filename': new_file, 'status': 'renamed', 'additions': 0, 'deletions': 0, 'binary': False, 'old_content': None, 'new_content': None})
+                    changed_files.append({'old_filename': old_file, 'filename': new_file, 'status': 'renamed', 'additions': 0, 'deletions': 0, 'binary': False, 'diff': None})
                 else:
                     filename = parts[1]
-                    changed_files.append({'filename': filename, 'status': {'A': 'added', 'M': 'modified', 'D': 'deleted'}.get(status, 'unknown'), 'additions': 0, 'deletions': 0, 'binary': False, 'old_content': None, 'new_content': None})
+                    #changed_files.append({'filename': filename, 'status': {'A': 'added', 'M': 'modified', 'D': 'deleted'}.get(status, 'unknown'), 'additions': 0, 'deletions': 0, 'binary': False, 'old_content': None, 'new_content': None})
+                    changed_files.append({'filename': filename, 'status': {'A': 'added', 'M': 'modified', 'D': 'deleted'}.get(status, 'unknown'), 'additions': 0, 'deletions': 0, 'binary': False, 'diff': None})
 
         # Get numstat
         command = [GIT_EXECUTABLE, "-C", repo_path, "diff", "--numstat", f"{commit_sha}^..{commit_sha}"]
@@ -2465,21 +2467,36 @@ def get_commit_diff(repo_path, commit_sha):
                 num_map[file] = {'additions': int(add) if add != '-' else 0, 'deletions': int(del_) if del_ != '-' else 0}
 
         # Get contents
+        if False:
+            for f in changed_files:
+                filename = f['filename']
+                f['additions'] = num_map.get(filename, {}).get('additions', 0)
+                f['deletions'] = num_map.get(filename, {}).get('deletions', 0)
+                if f['status'] != 'deleted':
+                    command = [GIT_EXECUTABLE, "-C", repo_path, "show", f"{commit_sha}:{filename}"]
+                    output = run_git_command(repo_path, command)
+                    f['new_content'] = output if not output.startswith("Error:") else None
+                if f['status'] != 'added':
+                    old_filename = f.get('old_filename', filename)
+                    command = [GIT_EXECUTABLE, "-C", repo_path, "show", f"{commit_sha}^:{old_filename}"]
+                    output = run_git_command(repo_path, command)
+                    f['old_content'] = output if not output.startswith("Error:") else None
+                if f['old_content'] is None and f['new_content'] is None:
+                    f['binary'] = True
+
+        # Get raw diffs
         for f in changed_files:
             filename = f['filename']
             f['additions'] = num_map.get(filename, {}).get('additions', 0)
             f['deletions'] = num_map.get(filename, {}).get('deletions', 0)
-            if f['status'] != 'deleted':
-                command = [GIT_EXECUTABLE, "-C", repo_path, "show", f"{commit_sha}:{filename}"]
-                output = run_git_command(repo_path, command)
-                f['new_content'] = output if not output.startswith("Error:") else None
-            if f['status'] != 'added':
+            if f['status'] in ['modified', 'added', 'deleted', 'renamed']:
                 old_filename = f.get('old_filename', filename)
-                command = [GIT_EXECUTABLE, "-C", repo_path, "show", f"{commit_sha}^:{old_filename}"]
+                command = [GIT_EXECUTABLE, "-C", repo_path, "diff", f"{commit_sha}^", f"{commit_sha}", "--", old_filename]
                 output = run_git_command(repo_path, command)
-                f['old_content'] = output if not output.startswith("Error:") else None
-            if f['old_content'] is None and f['new_content'] is None:
-                f['binary'] = True
+                f['diff'] = output if not output.startswith("Error:") else None
+                if f['diff'] and "Binary files" in f['diff']:
+                    f['binary'] = True
+                    f['diff'] = "Binary file differs"
 
         return changed_files
     except Exception as e:
