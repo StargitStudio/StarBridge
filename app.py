@@ -764,7 +764,8 @@ def get_git_status_data(repo_path, git_executable="git"):
             "modified": [],
             "deleted": [],
             "renamed": [],
-            "untracked": []
+            "untracked": [],
+            "conflicts": []
         }
 
         branch_line = output[0] if output else ""
@@ -781,7 +782,8 @@ def get_git_status_data(repo_path, git_executable="git"):
                 continue
 
             status_code = parts[0]
-            file_path = parts[1]
+            #file_path = parts[1]
+            file_path = ' '.join(parts[1:]) if len(parts) > 2 else parts[1]
 
             # Detect merge conflicts
             if "U" in status_code:  
@@ -798,17 +800,33 @@ def get_git_status_data(repo_path, git_executable="git"):
                 summary["renamed"].append({"from": old.strip(), "to": new.strip()})
             elif status_code == "??":
                 summary["untracked"].append(file_path)
+            elif status_code == 'AA': # merge where both our and thiers added new file with same name
+                has_conflict = True
+                summary["conflicts"].append(file_path)
+            elif status_code == 'U' or status_code.startswith('U') :  # Unmerged (conflict)
+                has_conflict = True
+                summary["conflicts"].append(file_path)
 
         has_pending_changes = any(summary[k] for k in summary if k != "untracked")
         only_untracked = bool(summary["untracked"]) and not has_pending_changes
 
+        # Detect merge/rebase state
+        merge_head = os.path.exists(os.path.join(repo_path, '.git', 'MERGE_HEAD'))
+        rebase_merge = os.path.exists(os.path.join(repo_path, '.git', 'rebase-merge'))
+        rebase_apply = os.path.exists(os.path.join(repo_path, '.git', 'rebase-apply'))
+
         # Determine action_summary
-        if has_conflict:
+        #if has_conflict:
+        if has_conflict or merge_head or rebase_merge or rebase_apply:
             action_summary = "Merge conflict"
+            action_message = f"{len(summary['conflicts'])} conflicted file(s). Resolve and continue."
         elif has_pending_changes:
             action_summary = "Pending changes"
+            details = [f"{len(v)} {k}" for k, v in summary.items() if v]
+            action_message = f"Pending changes detected: {', '.join(details)}. Commit or stash your changes."
         elif only_untracked:
             action_summary = "Untracked files"
+            action_message = f"{len(summary['untracked'])} untracked file(s) detected. You may want to add them."
         else:
             # Check if branch is ahead/behind remote
             ahead = re.search(r"\[ahead (\d+)\]", branch_line)
@@ -820,22 +838,24 @@ def get_git_status_data(repo_path, git_executable="git"):
                 action_summary = "Ready to push"
             else:
                 action_summary = "Up to date"
+                action_message = "No changes detected. Working directory is clean."
 
         # Build action_message as before
-        if has_pending_changes:
-            details = [f"{len(v)} {k}" for k, v in summary.items() if v]
-            action_message = f"Pending changes detected: {', '.join(details)}. Please commit or stash your changes."
-        elif only_untracked:
-            action_message = f"{len(summary['untracked'])} untracked file(s) detected. You may want to add them."
-        elif has_conflict:
-            action_message = "Merge conflicts detected. Resolve them before continuing."
-        else:
-            action_message = "No changes detected. Working directory is clean."
+        #if has_pending_changes:
+        #    details = [f"{len(v)} {k}" for k, v in summary.items() if v]
+        #    action_message = f"Pending changes detected: {', '.join(details)}. Please commit or stash your changes."
+        #elif only_untracked:
+        #    action_message = f"{len(summary['untracked'])} untracked file(s) detected. You may want to add them."
+        #elif has_conflict:
+        #    action_message = "Merge conflicts detected. Resolve them before continuing."
+        #else:
+        #    action_message = "No changes detected. Working directory is clean."
 
         status_data = {
             "summary": summary,
             "action_message": action_message,
-            "action_summary": action_summary
+            "action_summary": action_summary,
+            "merge_in_progress": merge_head or rebase_merge or rebase_apply
         }
         return status_data, None
 
@@ -1998,6 +2018,17 @@ def collect_repo_details():
     
     return servers
 
+def safe_rev_parse(repo_path, ref):
+    """Safely resolve a ref, even during rebase or detached HEAD"""
+    result = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "rev-parse", "--verify", ref])
+    if result.startswith("Error:") or not result.strip():
+        # Fallback: try to resolve via HEAD if ref is current
+        current = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "symbolic-ref", "-q", "HEAD"])
+        if current and current.strip().endswith(ref):
+            return run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "rev-parse", "HEAD"])
+        return None
+    return result.strip()
+
 # Collect lightweight summaries
 def collect_repo_summaries():
     summaries = {}
@@ -2007,9 +2038,22 @@ def collect_repo_summaries():
         heads = {}
         for branch in branches_data['local_branches']:
             branch_name = branch['name']
-            head_sha = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "rev-parse", branch_name])
+            head_sha = safe_rev_parse(repo_path, branch_name)
+            #head_sha = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "rev-parse", branch_name])
             heads[branch_name] = head_sha
-        summaries[repo_name] = {'heads': heads}
+        #summaries[repo_name] = {'heads': heads}
+
+        # ADD THIS: Always compute current status
+        status_data, _ = get_git_status_data(repo_path)
+        summaries[repo_name] = {
+            'heads': heads,
+            'status': status_data  # ← This is the key addition
+        }
+
+        print("collect_repo_summaries status", status_data, flush=True)
+
+        print("summaries ", json.dumps(summaries, indent=4))
+
     return summaries
 
 # Compute delta for a repo/branch
@@ -2549,6 +2593,175 @@ def process_tasks(tasks):
             else:
                 results.append({"task_id": task['id'], "result": {"files": files}, "error": None})
 
+        elif action == 'resolve_conflict':
+            params = task.get('params', {})
+            repo_name = params.get('repo_name')
+            file_path = params.get('file_path')
+            resolution = params.get('resolution')  # ours, theirs, local, content
+
+            repo_path = find_repo_path(repo_name)
+            if not repo_path:
+                results.append({"task_id": task['id'], "error": "Repo not found"})
+                continue
+
+            try:
+                full_path = os.path.join(repo_path, file_path)
+
+                if resolution == "ours":
+                    subprocess.run([GIT_EXECUTABLE, "-C", repo_path, "checkout", "--ours", file_path], check=True, capture_output=True)
+                    logger.info(f"Resolved {file_path}: Kept OURS")
+
+                elif resolution == "theirs":
+                    subprocess.run([GIT_EXECUTABLE, "-C", repo_path, "checkout", "--theirs", file_path], check=True, capture_output=True)
+                    logger.info(f"Resolved {file_path}: Kept THEIRS")
+
+                elif resolution == "local":
+                    # Just stage current working tree version (no checkout)
+                    logger.info(f"Resolved {file_path}: Kept CURRENT working tree version")
+                    pass  # Nothing to do — file is already as user wants
+
+                elif resolution == "content":
+                    content = params.get('content', '')
+                    with open(full_path, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    logger.info(f"Resolved {file_path}: Replaced with provided content")
+
+                else:
+                    results.append({"task_id": task['id'], "error": f"Invalid resolution: {resolution}"})
+                    continue
+
+                # Always stage the final version
+                result = subprocess.run([GIT_EXECUTABLE, "-C", repo_path, "add", file_path], capture_output=True, text=True)
+                if result.returncode != 0:
+                    results.append({"task_id": task['id'], "error": f"git add failed: {result.stderr}"})
+                    continue
+
+                results.append({
+                    "task_id": task['id'],
+                    "result": {
+                        "status": "resolved",
+                        "resolution": resolution,
+                        "file": file_path
+                    }
+                })
+
+            except Exception as e:
+                logger.error(f"Conflict resolution failed for {file_path}: {str(e)}")
+                results.append({"task_id": task['id'], "error": str(e)})
+
+        elif action == 'continue_merge':
+            logger.debug(">>>>>>>>> continue_merge >>>>>>>>>")
+
+            try:
+                params = task.get('params') or {}
+                repo_name = params.get('repo_name')
+                commit_message = params.get('commit_message')
+
+                # Validate parameters
+                if not repo_name:
+                    results.append({"task_id": task["id"], "error": "Missing repo_name"})
+                    continue
+                if not commit_message:
+                    results.append({"task_id": task["id"], "error": "Missing commit_message"})
+                    continue
+
+                repo_path = find_repo_path(repo_name)
+                if not repo_path:
+                    results.append({"task_id": task["id"], "error": f"Repository '{repo_name}' not found"})
+                    continue
+
+                # Detect merge or rebase in progress
+                git_dir = os.path.join(repo_path, ".git")
+
+                is_rebase = (
+                    os.path.exists(os.path.join(git_dir, "rebase-merge")) or
+                    os.path.exists(os.path.join(git_dir, "rebase-apply"))
+                )
+                is_merge = os.path.exists(os.path.join(git_dir, "MERGE_HEAD"))
+
+                logger.debug(f"Repo path: {repo_path}")
+                logger.debug(f"is_rebase={is_rebase}, is_merge={is_merge}")
+
+                if not is_merge and not is_rebase:
+                    results.append({
+                        "task_id": task["id"],
+                        "error": "No merge or rebase is currently in progress"
+                    })
+                    continue
+
+                # First: try merge --continue if merge in progress
+                if is_merge:
+                    logger.debug("Attempting: git merge --continue")
+
+                    merge_cmd = [
+                        GIT_EXECUTABLE, "-C", repo_path,
+                        "merge", "--continue"
+                    ]
+
+                    merge_result = subprocess.run(
+                        merge_cmd, capture_output=True, text=True
+                    )
+
+                    logger.debug({
+                        "merge_stdout": merge_result.stdout,
+                        "merge_stderr": merge_result.stderr,
+                        "return_code": merge_result.returncode
+                    })
+
+                    if merge_result.returncode == 0:
+                        logger.info({"task_id": task["id"], "result": {"status": "merge_completed"}})
+                        results.append({"task_id": task["id"], "result": {"status": "merge_completed"}})
+                        continue
+
+                    # If merge failed and no rebase is present → fatal
+                    if not is_rebase:
+                        results.append({
+                            "task_id": task["id"],
+                            "error": merge_result.stderr or merge_result.stdout or "Unknown merge error"
+                        })
+                        continue
+
+                # If here → merge didn't apply OR we are in rebase → try rebase --continue
+                logger.debug("Attempting: git rebase --continue")
+
+                # For rebase, Git uses an internal commit message — but we can write ours into .git/rebase-merge/message
+                rebase_msg_path = os.path.join(git_dir, "rebase-merge", "message")
+                if is_rebase:
+                    try:
+                        os.makedirs(os.path.dirname(rebase_msg_path), exist_ok=True)
+                        with open(rebase_msg_path, "w", encoding="utf-8") as f:
+                            f.write(commit_message)
+                        logger.debug("Custom commit message written to rebase-merge/message")
+                    except Exception as msg_err:
+                        logger.error(f"Failed to write rebase commit message: {msg_err}")
+
+                rebase_cmd = [
+                    GIT_EXECUTABLE, "-C", repo_path,
+                    "rebase", "--continue"
+                ]
+
+                rebase_result = subprocess.run(
+                    rebase_cmd, capture_output=True, text=True
+                )
+
+                logger.debug({
+                    "rebase_stdout": rebase_result.stdout,
+                    "rebase_stderr": rebase_result.stderr,
+                    "return_code": rebase_result.returncode
+                })
+
+                if rebase_result.returncode == 0:
+                    results.append({"task_id": task["id"], "result": {"status": "merge_completed"}})
+                else:
+                    results.append({
+                        "task_id": task["id"],
+                        "error": rebase_result.stderr or rebase_result.stdout or "Unknown rebase error"
+                    })
+
+            except Exception as e:
+                logger.error(f"Merge Continue failed for {repo_name}: {str(e)}")
+                results.append({"task_id": task["id"], "error": str(e)})
+                    
         else:
             logger.warning(f"Unknown action: {action}")
             results.append({"task_id": task['id'], "result": None, "error": f"Unknown action: {action}"})
