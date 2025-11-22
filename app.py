@@ -743,129 +743,126 @@ def commit():
 
 def get_git_status_data(repo_path, git_executable="git"):
     """
-    Get detailed Git status for the given repository path.
-    Returns:
-        (status_data, error)
-        where `error` is None if success, otherwise a dict with details.
+    Full Git status with staged/unstaged/conflicts support using porcelain=v2.
     """
     try:
-        # Run `git status --porcelain` to detect changes
+        # Use porcelain=v2 with -z for machine-readable, unambiguous output
         result = subprocess.run(
-            [git_executable, "status", "--porcelain", "-b"],
-            cwd=repo_path,
+            [git_executable, "-C", repo_path, "status", "--porcelain=v2", "-z", "--branch"],
             capture_output=True,
             text=True,
             check=True
         )
-        output = result.stdout.strip().splitlines()
+        entries = [e for e in result.stdout.split('\0') if e]
 
         summary = {
-            "added": [],
-            "modified": [],
-            "deleted": [],
-            "renamed": [],
+            "conflicts": [],
+            "staged": [],      # Changes in index (to be committed)
+            "unstaged": [],    # Changes in working tree (not staged)
             "untracked": [],
-            "conflicts": []
+            "renamed": [],
+            "added": [],       # New files staged
+            "modified": [],    # Modified files (legacy)
+            "deleted": []      # Deleted files
         }
 
-        branch_line = output[0] if output else ""
-        has_conflict = False
-        has_pending_changes = False
-        only_untracked = False
-
-        for line in output[1:]:  # skip branch line
-            if not line.strip():
-                continue
-
-            parts = line.split(maxsplit=2)
-            if len(parts) < 2:
-                continue
-
-            status_code = parts[0]
-            #file_path = parts[1]
-            file_path = ' '.join(parts[1:]) if len(parts) > 2 else parts[1]
-
-            # Detect merge conflicts
-            if "U" in status_code:  
-                has_conflict = True
-
-            if status_code == "A":
-                summary["added"].append(file_path)
-            elif status_code == "M":
-                summary["modified"].append(file_path)
-            elif status_code == "D":
-                summary["deleted"].append(file_path)
-            elif status_code.startswith("R") and "->" in file_path:
-                old, new = file_path.split("->", 1)
-                summary["renamed"].append({"from": old.strip(), "to": new.strip()})
-            elif status_code == "??":
-                summary["untracked"].append(file_path)
-            elif status_code == 'AA': # merge where both our and thiers added new file with same name
-                has_conflict = True
-                summary["conflicts"].append(file_path)
-            elif status_code == 'U' or status_code.startswith('U') :  # Unmerged (conflict)
-                has_conflict = True
-                summary["conflicts"].append(file_path)
-
-        has_pending_changes = any(summary[k] for k in summary if k != "untracked")
-        only_untracked = bool(summary["untracked"]) and not has_pending_changes
-
-        # Detect merge/rebase state
         merge_head = os.path.exists(os.path.join(repo_path, '.git', 'MERGE_HEAD'))
         rebase_merge = os.path.exists(os.path.join(repo_path, '.git', 'rebase-merge'))
         rebase_apply = os.path.exists(os.path.join(repo_path, '.git', 'rebase-apply'))
+        merge_in_progress = merge_head or rebase_merge or rebase_apply
 
-        # Determine action_summary
-        #if has_conflict:
-        if has_conflict or merge_head or rebase_merge or rebase_apply:
+        branch_info = ""
+        for entry in entries:
+            parts = entry.split()
+            if not parts:
+                continue
+
+            code = parts[0]
+
+            # Branch info line: # branch.oid ...
+            if code == "#":
+                if parts[1].startswith("branch.head"):
+                    branch_info = " ".join(parts[2:])
+                continue
+
+            # Ordinary entry: 1 XY sub path
+            # u XY sub path (conflict)
+            # ? path (untracked)
+            if code in ("1", "2"):  # Ordinary entry
+                xy = parts[1]
+                path = " ".join(parts[8:]) if len(parts) > 8 else parts[-1]
+
+                # Staged changes (index != HEAD)
+                if xy[0] != ".":
+                    if xy[0] == "A":
+                        summary["added"].append(path)
+                    elif xy[0] == "M":
+                        summary["staged"].append(path)
+                    elif xy[0] == "D":
+                        summary["deleted"].append(path)
+                    elif xy[0] == "R":
+                        old, new = path.split(" -> ")
+                        summary["renamed"].append({"from": old.strip(), "to": new.strip()})
+                        summary["staged"].append(new.strip())
+
+                # Unstaged changes (worktree != index)
+                if xy[1] != ".":
+                    if xy[1] in ("M", "D"):
+                        summary["unstaged"].append(path)
+
+            elif code == "u":  # Unmerged (conflict)
+                path = " ".join(parts[8:]) if len(parts) > 8 else parts[-1]
+                summary["conflicts"].append(path)
+
+            elif code == "?":  # Untracked
+                path = " ".join(parts[1:])
+                summary["untracked"].append(path)
+
+        # Smart action message
+        conflict_count = len(summary["conflicts"])
+        staged_count = len(summary["staged"]) + len(summary["added"]) + len(summary["deleted"]) + len(summary["renamed"])
+        unstaged_count = len(summary["unstaged"])
+
+        if conflict_count > 0:
             action_summary = "Merge conflict"
-            action_message = f"{len(summary['conflicts'])} conflicted file(s). Resolve and continue."
-        elif has_pending_changes:
-            action_summary = "Pending changes"
-            details = [f"{len(v)} {k}" for k, v in summary.items() if v]
-            action_message = f"Pending changes detected: {', '.join(details)}. Commit or stash your changes."
-        elif only_untracked:
-            action_summary = "Untracked files"
-            action_message = f"{len(summary['untracked'])} untracked file(s) detected. You may want to add them."
-        else:
-            # Check if branch is ahead/behind remote
-            ahead = re.search(r"\[ahead (\d+)\]", branch_line)
-            behind = re.search(r"\[behind (\d+)\]", branch_line)
-
-            if behind:
-                action_summary = "Ready to pull"
-            elif ahead:
-                action_summary = "Ready to push"
+            action_message = f"{conflict_count} conflicted file(s). Resolve to continue."
+        elif merge_in_progress:
+            if unstaged_count > 0:
+                action_summary = "Merge in progress"
+                action_message = f"{unstaged_count} unstaged change(s) remain. Stage or discard to continue."
+            elif staged_count > 0:
+                action_summary = "Ready to continue"
+                action_message = f"All conflicts resolved. {staged_count} file(s) staged. Click Continue Merge to finish."
             else:
-                action_summary = "Up to date"
-                action_message = "No changes detected. Working directory is clean."
+                action_summary = "Ready to continue"
+                action_message = "All changes staged. Click Continue Merge to complete."
+        elif staged_count > 0:
+            action_summary = "Ready to commit"
+            action_message = f"{staged_count} file(s) staged for commit."
+        elif unstaged_count > 0:
+            action_summary = "Pending changes"
+            action_message = f"{unstaged_count} unstaged change(s)."
+        elif summary["untracked"]:
+            action_summary = "Untracked files"
+            action_message = f"{len(summary['untracked'])} untracked file(s)."
+        else:
+            action_summary = "Up to date"
+            action_message = "Working tree clean."
 
-        # Build action_message as before
-        #if has_pending_changes:
-        #    details = [f"{len(v)} {k}" for k, v in summary.items() if v]
-        #    action_message = f"Pending changes detected: {', '.join(details)}. Please commit or stash your changes."
-        #elif only_untracked:
-        #    action_message = f"{len(summary['untracked'])} untracked file(s) detected. You may want to add them."
-        #elif has_conflict:
-        #    action_message = "Merge conflicts detected. Resolve them before continuing."
-        #else:
-        #    action_message = "No changes detected. Working directory is clean."
-
-        status_data = {
+        return {
             "summary": summary,
-            "action_message": action_message,
             "action_summary": action_summary,
-            "merge_in_progress": merge_head or rebase_merge or rebase_apply
-        }
-        return status_data, None
+            "action_message": action_message,
+            "merge_in_progress": merge_in_progress,
+            "branch": branch_info or "HEAD"
+        }, None
 
     except subprocess.CalledProcessError as e:
-        error_message = e.stderr.strip() if e.stderr else str(e)
-        logger.error("Git error retrieving status for %s: %s", repo_path, error_message)
-        return None, {"type": "GitError", "message": error_message}
-
+        error_msg = e.stderr.strip() or str(e)
+        logger.error(f"Git status failed for {repo_path}: {error_msg}")
+        return None, {"type": "GitError", "message": error_msg}
     except Exception as e:
-        logger.error("Unexpected error retrieving git status for %s: %s", repo_path, str(e))
+        logger.error(f"Unexpected error in get_git_status_data({repo_path}): {str(e)}")
         return None, {"type": "Exception", "message": str(e)}
 
 @app.route('/api/status', methods=['POST'])
@@ -2761,7 +2758,9 @@ def process_tasks(tasks):
             except Exception as e:
                 logger.error(f"Merge Continue failed for {repo_name}: {str(e)}")
                 results.append({"task_id": task["id"], "error": str(e)})
-                    
+
+        
+
         else:
             logger.warning(f"Unknown action: {action}")
             results.append({"task_id": task['id'], "result": None, "error": f"Unknown action: {action}"})
