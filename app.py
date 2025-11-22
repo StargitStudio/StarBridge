@@ -2548,6 +2548,19 @@ def get_commit_diff(repo_path, commit_sha):
 def process_tasks(tasks):
     logger.debug(f"Processing {len(tasks)} tasks")
     results = []
+
+    # Actions that modify the working tree / index and should return fresh status
+    STATUS_CHANGING_ACTIONS = {
+        "resolve_conflict",
+        "continue_merge",
+        "stage_file",
+        "unstage_file",
+        "discard_file",
+        "commit",           # future
+        "reset",            # future
+        "checkout_file",    # future
+    }
+
     for task in tasks:
         logger.debug(f"Task details: {task}")
         action = task.get('action')
@@ -2559,6 +2572,9 @@ def process_tasks(tasks):
             results.append({"task_id": task['id'], "result": None, "error": f"Repo {repo_name} not found"})
             continue
         
+        task_result = {"task_id": task['id'], 'repo_name': repo_name}
+        needs_status_refresh = action in STATUS_CHANGING_ACTIONS
+
         if action == 'get_file':
             file_path = params.get('file_path')
             commit_sha = params.get('commit_sha', 'HEAD')
@@ -2566,10 +2582,12 @@ def process_tasks(tasks):
             content_data, error = get_file_content(repo_path, file_path, commit_sha)
             if error:
                 logger.error(f"get_file error: {error}")
-                results.append({"task_id": task['id'], "result": None, "error": error})
+                #results.append({"task_id": task['id'], "result": None, "error": error})
+                task_result.update({"result": None, "error": error})
             else:
                 logger.debug(f"get_file success: {content_data}")
-                results.append({"task_id": task['id'], "result": content_data, "error": None})
+                #results.append({"task_id": task['id'], "result": content_data, "error": None})
+                task_result.update({"result": content_data, "error": None})
         
         elif action == 'get_file_history':
             file_path = params.get('file_path')
@@ -2577,18 +2595,22 @@ def process_tasks(tasks):
             logger.debug(f"get_file_history params: repo={repo_name}, path={file_path}, sha={commit_sha}")
             history = get_file_history(repo_path, file_path, commit_sha)
             if history is None:
-                results.append({"task_id": task['id'], "result": None, "error": "Failed to fetch history"})
+                #results.append({"task_id": task['id'], "result": None, "error": "Failed to fetch history"})
+                task_result.update({"result": None, "error": "Failed to fetch history"})
             else:
-                results.append({"task_id": task['id'], "result": {"history": history}, "error": None})
+                #results.append({"task_id": task['id'], "result": {"history": history}, "error": None})
+                task_result.update({"result": {"history": history}, "error": None})
         
         elif action == 'get_commit_diff':
             commit_sha = params.get('commit_sha')
             logger.debug(f"get_commit_diff params: repo={repo_name}, sha={commit_sha}")
             files = get_commit_diff(repo_path, commit_sha)
             if files is None:
-                results.append({"task_id": task['id'], "result": None, "error": "Failed to fetch commit diff"})
+                #results.append({"task_id": task['id'], "result": None, "error": "Failed to fetch commit diff"})
+                task_result.update({"result": None, "error": "Failed to fetch commit diff"})
             else:
-                results.append({"task_id": task['id'], "result": {"files": files}, "error": None})
+                #results.append({"task_id": task['id'], "result": {"files": files}, "error": None})
+                task_result.update({"result": {"files": files}, "error": None})
 
         elif action == 'resolve_conflict':
             params = task.get('params', {})
@@ -2633,8 +2655,7 @@ def process_tasks(tasks):
                     results.append({"task_id": task['id'], "error": f"git add failed: {result.stderr}"})
                     continue
 
-                results.append({
-                    "task_id": task['id'],
+                task_result.update({
                     "result": {
                         "status": "resolved",
                         "resolution": resolution,
@@ -2644,7 +2665,9 @@ def process_tasks(tasks):
 
             except Exception as e:
                 logger.error(f"Conflict resolution failed for {file_path}: {str(e)}")
+                #results.append({"task_id": task['id'], "error": str(e)})
                 results.append({"task_id": task['id'], "error": str(e)})
+                continue
 
         elif action == 'continue_merge':
             logger.debug(">>>>>>>>> continue_merge >>>>>>>>>")
@@ -2687,6 +2710,7 @@ def process_tasks(tasks):
                     continue
 
                 # First: try merge --continue if merge in progress
+                merge_completed = False
                 if is_merge:
                     logger.debug("Attempting: git merge --continue")
 
@@ -2707,63 +2731,142 @@ def process_tasks(tasks):
 
                     if merge_result.returncode == 0:
                         logger.info({"task_id": task["id"], "result": {"status": "merge_completed"}})
-                        results.append({"task_id": task["id"], "result": {"status": "merge_completed"}})
-                        continue
+                        task_result.update({"result": {"status": "merge_completed"}})
+                        merge_completed = True
 
                     # If merge failed and no rebase is present → fatal
-                    if not is_rebase:
-                        results.append({
+                    elif not is_rebase:
+                        result.append({
                             "task_id": task["id"],
                             "error": merge_result.stderr or merge_result.stdout or "Unknown merge error"
                         })
-                        continue
+                        continue 
 
-                # If here → merge didn't apply OR we are in rebase → try rebase --continue
-                logger.debug("Attempting: git rebase --continue")
+                if merge_completed == False:
+                    # If here → merge didn't apply OR we are in rebase → try rebase --continue
+                    logger.debug("Attempting: git rebase --continue")
 
-                # For rebase, Git uses an internal commit message — but we can write ours into .git/rebase-merge/message
-                rebase_msg_path = os.path.join(git_dir, "rebase-merge", "message")
-                if is_rebase:
-                    try:
-                        os.makedirs(os.path.dirname(rebase_msg_path), exist_ok=True)
-                        with open(rebase_msg_path, "w", encoding="utf-8") as f:
-                            f.write(commit_message)
-                        logger.debug("Custom commit message written to rebase-merge/message")
-                    except Exception as msg_err:
-                        logger.error(f"Failed to write rebase commit message: {msg_err}")
+                    # For rebase, Git uses an internal commit message — but we can write ours into .git/rebase-merge/message
+                    rebase_msg_path = os.path.join(git_dir, "rebase-merge", "message")
+                    if is_rebase:
+                        try:
+                            os.makedirs(os.path.dirname(rebase_msg_path), exist_ok=True)
+                            with open(rebase_msg_path, "w", encoding="utf-8") as f:
+                                f.write(commit_message)
+                            logger.debug("Custom commit message written to rebase-merge/message")
+                        except Exception as msg_err:
+                            logger.error(f"Failed to write rebase commit message: {msg_err}")
 
-                rebase_cmd = [
-                    GIT_EXECUTABLE, "-C", repo_path,
-                    "rebase", "--continue"
-                ]
+                    rebase_cmd = [
+                        GIT_EXECUTABLE, "-C", repo_path,
+                        "rebase", "--continue"
+                    ]
 
-                rebase_result = subprocess.run(
-                    rebase_cmd, capture_output=True, text=True
-                )
+                    rebase_result = subprocess.run(
+                        rebase_cmd, capture_output=True, text=True
+                    )
 
-                logger.debug({
-                    "rebase_stdout": rebase_result.stdout,
-                    "rebase_stderr": rebase_result.stderr,
-                    "return_code": rebase_result.returncode
-                })
-
-                if rebase_result.returncode == 0:
-                    results.append({"task_id": task["id"], "result": {"status": "merge_completed"}})
-                else:
-                    results.append({
-                        "task_id": task["id"],
-                        "error": rebase_result.stderr or rebase_result.stdout or "Unknown rebase error"
+                    logger.debug({
+                        "rebase_stdout": rebase_result.stdout,
+                        "rebase_stderr": rebase_result.stderr,
+                        "return_code": rebase_result.returncode
                     })
+
+                    if rebase_result.returncode == 0:
+                        task_result.update({"result": {"status": "merge_completed"}})
+                    else:
+                        results.append({
+                            "task_id": task["id"],
+                            "error": rebase_result.stderr or rebase_result.stdout or "Unknown rebase error"
+                        })
+                        continue
 
             except Exception as e:
                 logger.error(f"Merge Continue failed for {repo_name}: {str(e)}")
                 results.append({"task_id": task["id"], "error": str(e)})
+                continue
 
-        
+        elif action == "stage_file":
+            params = task.get('params', {})
+            repo_name = params.get('repo_name')
+            file_path = params.get('file_path')
+
+            repo_path = find_repo_path(repo_name)
+            if not repo_path:
+                results.append({"task_id": task['id'], "error": "Repo not found"})
+                continue
+
+            try:
+                subprocess.run([GIT_EXECUTABLE, "-C", repo_path, "add", file_path], check=True, capture_output=True)
+                task_result.update({
+                    "result": {
+                        "status": "staged", 
+                        "file": file_path
+                    }
+                })
+                logger.info(f"Staged: {file_path}")
+            except Exception as e:
+                results.append({"task_id": task['id'], "error": str(e)})
+                continue
+
+        elif action == "unstage_file":
+            params = task.get('params', {})
+            repo_name = params.get('repo_name')
+            file_path = params.get('file_path')
+
+            repo_path = find_repo_path(repo_name)
+            if not repo_path:
+                results.append({"task_id": task['id'], "error": "Repo not found"})
+                continue
+
+            try:
+                subprocess.run([GIT_EXECUTABLE, "-C", repo_path, "restore", "--staged", file_path], check=True, capture_output=True)
+                task_result.update({
+                    "result": {"status": "unstaged", "file": file_path}
+                })
+                logger.info(f"Unstaged: {file_path}")
+            except Exception as e:
+                results.append({"task_id": task['id'], "error": str(e)})
+                continue
+
+        elif action == "discard_file":
+            params = task.get('params', {})
+            repo_name = params.get('repo_name')
+            file_path = params.get('file_path')
+
+            repo_path = find_repo_path(repo_name)
+            if not repo_path:
+                results.append({"task_id": task['id'], "error": "Repo not found"})
+                continue
+
+            try:
+                subprocess.run([GIT_EXECUTABLE, "-C", repo_path, "restore", file_path], check=True, capture_output=True)
+                task_result.update({
+                    "result": {"status": "discarded", "file": file_path}
+                })
+                logger.info(f"Discarded changes: {file_path}")
+            except Exception as e:
+                results.append({"task_id": task['id'], "error": str(e)})
+                continue
 
         else:
             logger.warning(f"Unknown action: {action}")
             results.append({"task_id": task['id'], "result": None, "error": f"Unknown action: {action}"})
+            continue
+
+        # === AUTO-REFRESH STATUS ON STATUS-CHANGING ACTIONS ===
+        if needs_status_refresh:
+            fresh_status, status_error = get_git_status_data(repo_path)
+            if status_error:
+                logger.warning(f"Failed to refresh status after {action}: {status_error}")
+            else:
+                # Attach fresh status — Stargit will update DB instantly
+                if "result" not in task_result:
+                    task_result["result"] = {}
+                task_result["result"]["repo_status"] = fresh_status
+                logger.debug(f"Fresh status attached after {action}")
+
+        results.append(task_result)
     
     logger.debug(f"Processed results: {results}")
     return results
