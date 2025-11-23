@@ -15,7 +15,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import threading
 import psutil
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import mimetypes
 import base64 
 
@@ -3176,7 +3176,95 @@ def process_tasks(tasks):
                 f"[StarBridge] Pull completed for {repo_path} ({remote}/{branch}): "
                 f"{len(new_commits or [])} new commits."
             )
+
+        elif action == "reset_hard":
             
+            target = params.get('target', 'HEAD')  # e.g. "HEAD~3" or commit SHA
+
+            try:
+                # --- 1. Save current state as backup commit (undo safety) ---
+                backup_msg = f"StarGit backup before reset hard ({datetime.utcnow().isoformat()})"
+                backup_result = subprocess.run(
+                    [GIT_EXECUTABLE, "-C", repo_path, "commit", "--allow-empty", "-m", backup_msg],
+                    capture_output=True, text=True
+                )
+                if backup_result.returncode != 0:
+                    error_text = (backup_result.stderr or backup_result.stdout or "Failed to create backup commit").strip()
+                    logger.error(f"Backup commit failed: {error_text}")
+                    results.append({"task_id": task['id'], "error": "backup_commit_failed", "error_msg": error_text})
+                    continue
+                
+                now_utc = datetime.now(timezone.utc)
+                timestamp = now_utc.strftime("%Y-%m-%d_%H-%M-%S")
+
+                # --- Create backup folder ---
+                backup_dir = os.path.join(repo_path, ".stargit", "backups", timestamp)
+                os.makedirs(backup_dir, exist_ok=True)
+
+                # ---  Save backup message to file ---
+                backup_msg_file = os.path.join(backup_dir, f"{timestamp}_backup_commit_message.txt")
+                with open(backup_msg_file, "w", encoding="utf-8") as f:
+                    f.write(backup_msg)
+                # --- 4. Save current working tree diff ---
+                try:
+                    pre_diff = get_diff(repo_path)
+                    if pre_diff:
+                        diff_file = os.path.join(backup_dir, f"{timestamp}_pre_reset_diff.diff")
+                        with open(diff_file, "w", encoding="utf-8") as f:
+                            f.write(json.dumps(pre_diff, indent=2))
+                           
+                except Exception as e:
+                    logger.warning(f"Failed to get pre-reset diff: {e}")
+                    pre_diff = None
+
+                # 2. Get diff before reset (for UI)
+                try:
+                    pre_diff = get_diff(repo_path)
+                except Exception as e:
+                    logger.warning(f"Failed to get pre-reset diff: {e}")
+                    pre_diff = None
+
+                # 3. Hard reset
+                cmd = [GIT_EXECUTABLE, "-C", repo_path, "reset", "--hard", target]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+
+                if result.returncode != 0:
+                    error_text = (result.stderr or result.stdout or "Reset failed").strip()
+                    logger.error(f"Hard reset failed: {error_text}")
+                    results.append({"task_id": task['id'], "error": f"reset_failed: {error_text}"})
+                    continue
+
+                # 4. Fresh status + diff
+                try:
+                    fresh_status, _ = get_git_status_data(repo_path)
+                except Exception as e:
+                    logger.warning(f"Failed to get repo status after reset: {e}")
+                    fresh_status = {}
+
+                try:
+                    post_diff = get_diff(repo_path)
+                except Exception as e:
+                    logger.warning(f"Failed to get post-reset diff: {e}")
+                    post_diff = None
+
+                # --- 5. Append result ---
+                task_result.update({
+                    "result": {
+                        "status": "reset_hard_complete",
+                        "target": target,
+                        "backup_commit_message": backup_msg,
+                        "pre_reset_diff": pre_diff,
+                        "post_reset_diff": post_diff,
+                        "repo_status": fresh_status
+                    }
+                })
+
+                logger.info(f"[StarBridge] Hard reset to {target} completed with backup commit")
+
+            except Exception as e:
+                logger.exception(f"Exception during reset_hard: {str(e)}")
+                results.append({"task_id": task['id'], "error": str(e)})
+                
         else:
             logger.warning(f"Unknown action: {action}")
             results.append({"task_id": task['id'], "result": None, "error": f"Unknown action: {action}"})
