@@ -2663,7 +2663,7 @@ def process_tasks(tasks):
         "stage_file",
         "unstage_file",
         "discard_file",
-        "commit",           # future
+        "commit",
         "reset",            # future
         "checkout_file",    # future
         "push"
@@ -2675,6 +2675,7 @@ def process_tasks(tasks):
         params = task.get('params', {})
         repo_name = params.get('repo_name')
         repo_path = find_repo_path_by_name(repo_name)
+
         if not repo_path:
             logger.warning(f"Repo {repo_name} not found")
             results.append({"task_id": task['id'], "result": None, "error": f"Repo {repo_name} not found"})
@@ -2963,11 +2964,6 @@ def process_tasks(tasks):
             branch = params.get('branch', 'HEAD')
             force = params.get('force', False)
 
-            repo_path = find_repo_path_by_name(repo_name)
-            if not repo_path:
-                results.append({"task_id": task['id'], "error": "Repo not found"})
-                continue
-
             try:
                 cmd = [GIT_EXECUTABLE, "-C", repo_path, "push"]
                 if force:
@@ -2989,6 +2985,47 @@ def process_tasks(tasks):
                     })
             except Exception as e:
                 task_result.update({"error": str(e)})
+
+        elif action == "commit":
+            message = params.get('commit_message', '').strip()
+
+            if not message:
+                results.append({"task_id": task['id'], "error": "Commit message required"})
+                continue
+
+            try:
+                cmd = [GIT_EXECUTABLE, "-C", repo_path, "commit", "-a", "-m", message]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+
+                if result.returncode == 0:
+                    task_result.update({
+                        "result": {
+                            "status": "committed",
+                            "message": message
+                        }
+                    })
+                    logger.info(f"Commit successful: {message}")
+
+                else:
+                    logger.error(
+                        f"Commit FAILED.\n"
+                        f"Command: {' '.join(cmd)}\n"
+                        f"STDOUT:\n{result.stdout}\n"
+                        f"STDERR:\n{result.stderr}\n"
+                    )
+
+                    results.append({
+                        "task_id": task['id'],
+                        "error": "Commit failed",
+                        "stdout": result.stdout,
+                        "stderr": result.stderr
+                    })
+                    continue
+
+            except Exception as e:
+                logger.exception("Exception during commit")
+                results.append({"task_id": task['id'], "error": str(e)})
+                continue
                 
         else:
             logger.warning(f"Unknown action: {action}")
