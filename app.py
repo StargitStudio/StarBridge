@@ -2650,6 +2650,57 @@ def get_commit_diff(repo_path, commit_sha):
     except Exception as e:
         logger.error(f"Error getting commit diff for {commit_sha}: {str(e)}")
         return None
+
+def get_new_commits_and_diff(repo_path, old_head_sha=None):
+    """
+    Return new commits since old_head_sha (newest-first) and current working tree diff.
+
+    :param repo_path: Path to the Git repository
+    :param old_head_sha: SHA of the previous HEAD (None for first commit)
+    :return: (current_head_sha, list_of_new_commits, working_tree_diff)
+    """
+    try:
+        # Get current HEAD
+        current_head = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "rev-parse", "HEAD"]).strip()
+        if not current_head or current_head.startswith("Error:"):
+            return None, [], get_diff(repo_path)
+
+        new_commits = []
+
+        # Only get new commits if old_head_sha is set and differs from current HEAD
+        if old_head_sha and old_head_sha != current_head:
+            log_cmd = [
+                GIT_EXECUTABLE, "-C", repo_path, "log",
+                f"{old_head_sha}..{current_head}",
+                "--pretty=format:%H|%P|%an|%ae|%ad|%s", "--date=iso"
+            ]
+            log_output = run_git_command(repo_path, log_cmd)
+
+            for line in log_output.splitlines():
+                if not line.strip():
+                    continue
+                parts = line.split("|", 5)
+                if len(parts) < 6:
+                    continue
+                sha, parents_str, author_name, author_email, date, message = parts
+                parents = parents_str.split() if parents_str else []
+                new_commits.append({
+                    "sha": sha,
+                    "parents": parents,
+                    "author_name": author_name,
+                    "author_email": author_email,
+                    "date": date,
+                    "message": message
+                })
+
+        # Get working tree diff
+        diff_data = get_diff(repo_path)
+
+        return current_head, new_commits, diff_data
+
+    except Exception as e:
+        logger.error(f"Failed to get new commits/diff: {e}")
+        return None, [], None
     
 # Process tasks from poll response - handles 'get_file' and 'get_file_history' actions
 def process_tasks(tasks):
@@ -2994,14 +3045,29 @@ def process_tasks(tasks):
                 continue
 
             try:
+
+                
+                # CAPTURE OLD HEAD BEFORE COMMIT
+                old_head_sha = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "rev-parse", "HEAD"]).strip()
+                if old_head_sha.startswith("Error:") or not old_head_sha:
+                    old_head_sha = None  # First commit case
+
                 cmd = [GIT_EXECUTABLE, "-C", repo_path, "commit", "-a", "-m", message]
                 result = subprocess.run(cmd, capture_output=True, text=True)
 
                 if result.returncode == 0:
+
+                    # Now get fresh status + new commits
+                    new_head_sha, new_commits, diff_data = get_new_commits_and_diff(repo_path, old_head_sha or "")
+
                     task_result.update({
                         "result": {
                             "status": "committed",
-                            "message": message
+                            "message": message,
+                            "old_head": old_head_sha,
+                            "new_head": new_head_sha,
+                            "new_commits": new_commits or [],
+                            "diff": diff_data
                         }
                     })
                     logger.info(f"Commit successful: {message}")
