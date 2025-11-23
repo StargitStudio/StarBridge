@@ -162,7 +162,62 @@ def run_git_command(path, command):
     except subprocess.CalledProcessError as e:
         logger.error("Git command error: %s", e.stderr.strip())
         return f"Error: {e.stderr.strip()}"
-    
+
+def get_remote_heads(repo_path, timeout=3):
+    """
+    Safely return dict of remote refs:
+    {
+        'main': 'abc123...',
+        'feature/login': 'def456...'
+    }
+
+    Never blocks thanks to:
+    - timeout
+    - GIT_TERMINAL_PROMPT=0
+    - BatchMode=yes (no SSH password prompts)
+    """
+
+    remote_name = "origin"
+    remote_name = None
+
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"     # Disable HTTPS prompts
+    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"  # Disable SSH passphrases
+
+    if remote_name:
+        cmd = [GIT_EXECUTABLE, "-C", repo_path, "ls-remote", remote_name]
+    else:
+        cmd = [GIT_EXECUTABLE, "-C", repo_path, "ls-remote"]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": "timeout"}
+    except Exception as e:
+        return {"error": str(e)}
+
+    if result.returncode != 0:
+        return {"error": result.stderr.strip() or "ls-remote failed"}
+
+    heads = {}
+    for line in result.stdout.splitlines():
+        if "\t" not in line:
+            continue
+        sha, ref = line.split("\t", 1)
+
+        if ref.startswith("refs/heads/"):
+            heads[ref[len("refs/heads/"):]] = sha
+
+        elif ref.startswith(f"refs/remotes/{remote_name}/"):
+            heads[ref[len(f"refs/remotes/{remote_name}/"):]] = sha
+
+    return heads
+
 @app.route('/api/refs', methods=['POST'])
 def get_refs():
     logger.info("API endpoint /api/refs called")
@@ -1953,6 +2008,9 @@ def collect_repo_details():
         else:
             repo["status"] = status_data
         
+        remote_heads = get_remote_heads(repo_path)
+        repo["remote_heads"] = remote_heads
+
         # Get remotes
         remotes_info = []
         remotes_output = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "remote", "-v"])
@@ -2026,30 +2084,65 @@ def safe_rev_parse(repo_path, ref):
         return None
     return result.strip()
 
+def get_diff(repo_path):
+    try:
+        git_command = [GIT_EXECUTABLE, "-C", repo_path, "diff"]
+
+        result = subprocess.run(git_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            return {}
+        else:
+            diff_output = result.stdout
+            return {
+                "diff":diff_output  
+                }
+    except Exception as e:
+        logger.error("get_diff(): Exception computing diff: %s", str(e))
+        return {}
+
 # Collect lightweight summaries
-def collect_repo_summaries():
+def collect_repo_summaries(include_remote=True):
     summaries = {}
+    
     for repo_path in REPOSITORIES:
         repo_name = os.path.basename(repo_path)
+
+        print(f"[collect] Processing repo: {repo_name}", flush=True)
+
+        # --- Branch heads ---
+        print("[collect] get_branches_data", flush=True)
         branches_data, _ = get_branches_data(repo_path)
+
         heads = {}
         for branch in branches_data['local_branches']:
             branch_name = branch['name']
-            head_sha = safe_rev_parse(repo_path, branch_name)
-            #head_sha = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "rev-parse", branch_name])
-            heads[branch_name] = head_sha
-        #summaries[repo_name] = {'heads': heads}
+            heads[branch_name] = safe_rev_parse(repo_path, branch_name)
 
-        # ADD THIS: Always compute current status
+        # --- Status ---
+        print("[collect] get_git_status_data", flush=True)
         status_data, _ = get_git_status_data(repo_path)
+
+        # --- Remote heads (optional + timeout) ---
+        remote_heads = {}
+        if include_remote:
+            print("[collect] get_remote_heads", flush=True)
+            try:
+                remote_heads = get_remote_heads(repo_path, timeout=3)
+            except Exception as e:
+                print("[collect] remote head fetch failed:", e, flush=True)
+
+        diff = get_diff(repo_path)
+
+        # Build structure
         summaries[repo_name] = {
-            'heads': heads,
-            'status': status_data  # ← This is the key addition
+            "heads": heads,
+            "status": status_data,
+            "remote_heads": remote_heads,
+            "diff": diff
         }
 
-        print("collect_repo_summaries status", status_data, flush=True)
-
-        print("summaries ", json.dumps(summaries, indent=4))
+        print("collect_repo_summaries status:", status_data, flush=True)
+        print("summaries:", json.dumps(summaries, indent=4), flush=True)
 
     return summaries
 
@@ -2256,6 +2349,7 @@ def send_update(deltas, mode, access_token, headers, base_payload):
 # Send heartbeat to stargit.com
 def send_heartbeat_to_stargit(batch_mode=False):
     """Send heartbeat to stargit.com using token."""
+    print(">>>>>>>>>>>>. HEARTBEAT >>>>>>>>> 1 ", flush=True)
     logger.debug("Sending heartbeat to stargit.com")
     if not STARGIT_API_KEY:
         logger.info("Stargit registration disabled in .env")
@@ -2271,6 +2365,8 @@ def send_heartbeat_to_stargit(batch_mode=False):
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json"
     }
+
+    print(">>>>>>>>>>>>. HEARTBEAT >>>>>>>>> 2 ", flush=True)
 
     # Fetch IP with error handling
     try:
@@ -2290,9 +2386,15 @@ def send_heartbeat_to_stargit(batch_mode=False):
     }
 
     # Step 1: Probe with metrics and repo summaries
+    print(">>>>>>>>>>>>. HEARTBEAT >>>>>>>>> 3 ", flush=True)
     summaries = collect_repo_summaries()
+
+    print(">>>>>>>>>>>>. HEARTBEAT >>>>>>>>> 4 ", flush=True)
     metrics = collect_server_metrics()
 
+    print("posting hearbeat summaries", json.dumps(summaries, indent=4), flush=True)
+
+    print(">>>>>>>>>>>>. HEARTBEAT >>>>>>>>> 5 ", flush=True)
     payload = {**base_payload, "mode": "probe", "metrics": metrics, "repo_summaries": summaries}
     response = post_with_retry(HEARTBEAT_ENDPOINT, payload, headers, timeout=10)
 
@@ -2401,11 +2503,16 @@ def register_with_stargit(event_type='online'):
 
 def registration_thread():
     """Background thread for initial registration and periodic heartbeats."""
+    print("------------------------------------", flush=True)
+    print(">>>>>>>>>>>>>>>> registration_thread", flush=True)
     if STARGIT_API_KEY:
+        print(">>>>>>>>>>>>>>>> registration_thread using stargit api key", STARGIT_API_KEY, flush=True)
         register_with_stargit(event_type='online')  # Initial registration
         while True:
             send_heartbeat_to_stargit()  # Periodic heartbeat
             time.sleep(300)  # 5 minutes
+    else:
+        print("<<<<<<<<<<<< Invalid stargit api key", STARGIT_API_KEY, flush=True)
 
 # Binary-safe file fetch (git show returns bytes)
 def get_file_content(repo_path, file_path, ref='HEAD'):
@@ -2559,6 +2666,7 @@ def process_tasks(tasks):
         "commit",           # future
         "reset",            # future
         "checkout_file",    # future
+        "push"
     }
 
     for task in tasks:
@@ -2848,7 +2956,40 @@ def process_tasks(tasks):
             except Exception as e:
                 results.append({"task_id": task['id'], "error": str(e)})
                 continue
+        
+        elif action == "push":
+            
+            remote = params.get('remote', 'origin')
+            branch = params.get('branch', 'HEAD')
+            force = params.get('force', False)
 
+            repo_path = find_repo_path_by_name(repo_name)
+            if not repo_path:
+                results.append({"task_id": task['id'], "error": "Repo not found"})
+                continue
+
+            try:
+                cmd = [GIT_EXECUTABLE, "-C", repo_path, "push"]
+                if force:
+                    cmd.append("--force-with-lease")
+                cmd.extend([remote, branch])
+
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                
+                if result.returncode == 0:
+                    task_result.update({
+                        "result": {
+                            "status": "pushed",
+                            "output": result.stdout
+                        }
+                    })
+                else:
+                    task_result.update({
+                        "error": result.stderr or "Push failed"
+                    })
+            except Exception as e:
+                task_result.update({"error": str(e)})
+                
         else:
             logger.warning(f"Unknown action: {action}")
             results.append({"task_id": task['id'], "result": None, "error": f"Unknown action: {action}"})
@@ -2857,6 +2998,7 @@ def process_tasks(tasks):
         # === AUTO-REFRESH STATUS ON STATUS-CHANGING ACTIONS ===
         if needs_status_refresh:
             fresh_status, status_error = get_git_status_data(repo_path)
+            remote_heads = get_remote_heads(repo_path)
             if status_error:
                 logger.warning(f"Failed to refresh status after {action}: {status_error}")
             else:
@@ -2864,6 +3006,7 @@ def process_tasks(tasks):
                 if "result" not in task_result:
                     task_result["result"] = {}
                 task_result["result"]["repo_status"] = fresh_status
+                task_result["result"]["remote_heads"] = remote_heads  # ← This is gold
                 logger.debug(f"Fresh status attached after {action}")
 
         results.append(task_result)
@@ -2936,7 +3079,8 @@ if STARGIT_API_KEY:
     logger.info("Loaded STARBRIDGE_SERVER_UUID: %s", SERVER_UUID)
     threading.Thread(target=registration_thread, daemon=True).start()
     threading.Thread(target=poll_thread, daemon=True).start()
-
+else:
+    logger.info("No hearteat - hearbeat disabled", flush=True)
 # Endpoins for web server querying status and configuration
 # TODO : Secure these endpoints with authentication if exposed publicly
 @app.route('/internal/stats', methods=['GET'])
