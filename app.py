@@ -18,6 +18,7 @@ import psutil
 from datetime import datetime, timedelta, timezone
 import mimetypes
 import base64 
+import socket
 
 # auto-setup, will create .env and settings.json if not present
 import setup
@@ -1964,7 +1965,9 @@ def collect_server_metrics():
         uptime = time.time() - psutil.boot_time()
         cpu_percent = psutil.cpu_percent(interval=1)
         memory = psutil.virtual_memory()
+        host_name = socket.gethostname()
         stats = {
+            'host_name': host_name,
             "uptime_seconds": uptime,
             "cpu_percent": cpu_percent,
             "memory_percent": memory.percent,
@@ -3517,14 +3520,17 @@ if STARGIT_API_KEY:
     threading.Thread(target=poll_thread, daemon=True).start()
 else:
     logger.info("No hearteat - hearbeat disabled", flush=True)
+
 # Endpoins for web server querying status and configuration
 # TODO : Secure these endpoints with authentication if exposed publicly
 @app.route('/internal/stats', methods=['GET'])
 def internal_stats():
     # Uptime
     uptime = time.time() - psutil.Process(os.getpid()).create_time()
-    # Metrics (reuse collect_server_metrics if exists, or simple)
+    # Server hostname
+    host_name = socket.gethostname()
     metrics = {
+        'host_name': host_name,
         'uptime_seconds': uptime,
         'cpu_percent': psutil.cpu_percent(),
         'memory_percent': psutil.virtual_memory().percent,
