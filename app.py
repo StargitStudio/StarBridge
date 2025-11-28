@@ -2248,7 +2248,7 @@ def get_diff(repo_path):
         logger.error("get_diff(): Exception computing diff: %s", str(e))
         return {}
 
-# Collect lightweight summaries
+# Collect lightweight summaries DEPRECATED
 def collect_repo_summaries(include_remote=True):
     summaries = {}
     
@@ -2294,6 +2294,66 @@ def collect_repo_summaries(include_remote=True):
 
     return summaries
 
+def collect_and_send_repo_summary(repo_path, include_remote=True):
+    repo_name = os.path.basename(repo_path)
+    summary = {
+        "heads": {},
+        "status": {"action_summary": "Error", "action_message": "Failed to collect status"},
+        "remote_heads": {},
+        "diff": {"diff": "", "diff_info": {"original_size": 0, "status": "complete"}}
+    }
+
+    try:
+        print(f"[Heartbeat] Processing repo: {repo_name}", flush=True)
+
+        # 1. Local branch heads
+        try:
+            branches_data, err = get_branches_data(repo_path)
+            if err:
+                logger.warning(f"[{repo_name}] Failed to get branches: {err}")
+            else:
+                for branch in branches_data.get('local_branches', []):
+                    branch_name = branch['name']
+                    head_sha = safe_rev_parse(repo_path, branch_name)
+                    if head_sha:
+                        summary["heads"][branch_name] = head_sha
+        except Exception as e:
+            logger.error(f"[{repo_name}] Error getting local heads: {e}")
+
+        # 2. Status
+        try:
+            status_data, err = get_git_status_data(repo_path)
+            if err:
+                logger.warning(f"[{repo_name}] Status error: {err}")
+            else:
+                summary["status"] = status_data or {}
+        except Exception as e:
+            logger.error(f"[{repo_name}] Fatal status error: {e}")
+
+        # 3. Remote heads (non-blocking)
+        if include_remote:
+            try:
+                remote_heads = get_remote_heads(repo_path, timeout=3)
+                summary["remote_heads"] = remote_heads or {}
+            except Exception as e:
+                logger.debug(f"[{repo_name}] Remote heads failed (normal): {e}")
+
+        # 4. Working tree diff
+        try:
+            diff = get_diff(repo_path)
+            summary["diff"] = diff or {"diff": "", "diff_info": {"original_size": 0}}
+        except Exception as e:
+            logger.error(f"[{repo_name}] Diff collection failed: {e}")
+            summary["diff"] = {"diff": f"# Error collecting diff: {str(e)}", "diff_info": {"status": "error"}}
+
+        print(f"[{repo_name}] Summary collected successfully", flush=True)
+        return repo_name, summary
+
+    except Exception as e:
+        logger.error(f"[{repo_name}] Unexpected error in collect_and_send_repo_summary: {e}", exc_info=True)
+        summary["status"]["action_message"] = f"Internal error: {str(e)[:100]}"
+        return repo_name, summary
+    
 # Compute delta for a repo/branch
 def compute_commit_delta(repo_path, branch, last_head):
     """
@@ -2496,95 +2556,116 @@ def send_update(deltas, mode, access_token, headers, base_payload):
 
 # Send heartbeat to stargit.com
 def send_heartbeat_to_stargit(batch_mode=False):
-    """Send heartbeat to stargit.com using token."""
-    print(">>>>>>>>>>>>. HEARTBEAT >>>>>>>>> 1 ", flush=True)
-    logger.debug("Sending heartbeat to stargit.com")
+    logger.debug(">>>>>>>>>> Sending heartbeat to stargit.com")
     if not STARGIT_API_KEY:
         logger.info("Stargit registration disabled in .env")
         return
+
     access_token = get_access_token()
-    if not access_token or not tokens['api_key_uuid']:
-        logger.error("No valid access token or api_key_uuid; registration aborted (key: %s...)", STARGIT_API_KEY[:8] if STARGIT_API_KEY else "None")
+    if not access_token:
+        logger.error("No valid access token — aborting heartbeat")
         return
-    else:
-        logger.info("Valid access token received: %s...", access_token[:10])  # Mask for logs
 
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json"
     }
 
-    print(">>>>>>>>>>>>. HEARTBEAT >>>>>>>>> 2 ", flush=True)
-
-    # Fetch IP with error handling
     try:
-        ip_response = requests.get('https://api.ipify.org', timeout=5)
-        ip_response.raise_for_status()
-        ip_address = ip_response.text
-    except Exception as e:
-        logger.warning(f"Failed to fetch IP: {str(e)}; using None")
+        ip_address = requests.get('https://api.ipify.org', timeout=5).text
+    except:
         ip_address = None
 
     base_payload = {
         "server_uuid": SERVER_UUID,
-        "event_type": 'heartbeat',
+        "event_type": "heartbeat",
         "status": "online",
         "timestamp": time.time(),
         "ip_address": ip_address
     }
 
-    # Step 1: Probe with metrics and repo summaries
-    print(">>>>>>>>>>>>. HEARTBEAT >>>>>>>>> 3 ", flush=True)
-    summaries = collect_repo_summaries()
-
-    print(">>>>>>>>>>>>. HEARTBEAT >>>>>>>>> 4 ", flush=True)
     metrics = collect_server_metrics()
 
-    print("posting hearbeat summaries", json.dumps(summaries, indent=4), flush=True)
-
-    print(">>>>>>>>>>>>. HEARTBEAT >>>>>>>>> 5 ", flush=True)
-    payload = {**base_payload, "mode": "probe", "metrics": metrics, "repo_summaries": summaries}
-    response = post_with_retry(HEARTBEAT_ENDPOINT, payload, headers, timeout=10)
+    # === Step 2: Send Metrics ===
+    payload = {**base_payload, "mode": "probe", "metrics": metrics}
+    response = post_with_retry(HEARTBEAT_ENDPOINT, payload, headers, timeout=15)
+    logger.info(">>>>>>>>>> Sending hearbeat metrics")
 
     if response.status_code == 401:
-        response = refresh_token_and_retry(access_token, post_with_retry, HEARTBEAT_ENDPOINT, payload, headers, timeout=10)
+        response = refresh_token_and_retry(access_token, post_with_retry, HEARTBEAT_ENDPOINT, payload, headers)
 
-    if response.status_code == 200:
+    if response.status_code != 200:
+        logger.error(f"Heartbeat probe failed: {response.text}")
+        return
+
+    successful_repos = []
+    failed_repos = []
+
+    for repo_path in REPOSITORIES:
+        repo_name = os.path.basename(repo_path)
+        logger.info(f">>>>>>>>>> Heartbeat → Processing repository: {repo_name}")
+
+        # === 1. Collect summary for THIS repo only ===
+        repo_name_out, summary = collect_and_send_repo_summary(repo_path)
+        if repo_name_out != repo_name:
+            logger.warning(f"Repo name mismatch: expected {repo_name}, got {repo_name_out}")
+            failed_repos.append(repo_name)
+            continue
+
+        # === 2. Send PROBE for THIS repo only ===
+        probe_payload = {
+            **base_payload,
+            "mode": "probe",
+            "repo_summaries": {repo_name: summary}  # send single repo update
+        }
+
         try:
+            response = post_with_retry(HEARTBEAT_ENDPOINT, probe_payload, headers, timeout=15)
+            if response.status_code == 401:
+                response = refresh_token_and_retry(access_token, post_with_retry,
+                                                  HEARTBEAT_ENDPOINT, probe_payload, headers)
+
+            if response.status_code != 200:
+                logger.error(f"[{repo_name}] Probe failed: {response.text}")
+                failed_repos.append(repo_name)
+                continue
+
             data = response.json()
-            needed_deltas = data.get('needed_deltas', {})
-            # Validate structure
-            if not isinstance(needed_deltas, dict):
-                raise ValueError("needed_deltas is not a dict")
-            for repo, branches in needed_deltas.items():
-                if not isinstance(branches, dict):
-                    raise ValueError(f"Branches for {repo} is not a dict")
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.error(f"Invalid response JSON or structure: {str(e)}; body: {response.text}")
-            return  # Abort; retry next cycle
+            needed_deltas = data.get("needed_deltas", {})
 
-        # === Main Logic Compute Delta and Send Update ===
-        if needed_deltas:
-            logger.info("Computing deltas for %d repositories", len(needed_deltas))
+            # === 3. If server wants delta → compute and send immediately ===
+            if needed_deltas and repo_name in needed_deltas:
+                branch_deltas = needed_deltas[repo_name]
+                try:
+                    delta = compute_repo_deltas(repo_name, branch_deltas, {repo_name: summary})
+                    if delta:
+                        delta_payload = {
+                            **base_payload,
+                            "mode": "update",
+                            "deltas": {repo_name: delta}
+                        }
+                        resp = post_with_retry(HEARTBEAT_ENDPOINT, delta_payload, headers, timeout=30)
+                        if resp.status_code == 200:
+                            logger.info(f"[{repo_name}] Full sync completed")
+                        else:
+                            logger.error(f"[{repo_name}] Delta send failed: {resp.text}")
+                except Exception as e:
+                    logger.error(f"[{repo_name}] Delta computation failed: {e}", exc_info=True)
 
-            if batch_mode:
-                logger.info("Batch mode: computing all deltas together")
-                deltas = {
-                    repo_name: repo_deltas
-                    for repo_name, branch_deltas in needed_deltas.items()
-                    if (repo_deltas := compute_repo_deltas(repo_name, branch_deltas, summaries))
-                }
-                send_update(deltas, "batch", access_token, headers, base_payload)
-            else:
-                logger.info("Per-repo mode: sending deltas individually")
-                for repo_name, branch_deltas in needed_deltas.items():
-                    if repo_deltas := compute_repo_deltas(repo_name, branch_deltas, summaries):
-                        send_update({repo_name: repo_deltas}, "per-repo", access_token, headers, base_payload)
-                        time.sleep(0.02)
-        else:
-            logger.info("No deltas needed")
-    else:
-        logger.error("Heartbeat probe failed: %s (status: %d); will retry next cycle", response.text, response.status_code)
+            successful_repos.append(repo_name)
+            logger.info(f"[{repo_name}] Heartbeat cycle completed successfully")
+
+        except Exception as e:
+            logger.error(f"[{repo_name}] Unexpected error in heartbeat cycle: {e}", exc_info=True)
+            failed_repos.append(repo_name)
+
+    # === Final Summary ===
+    total = len(REPOSITORIES)
+    logger.info(f"Heartbeat completed: {len(successful_repos)}/{total} repos synced")
+    if failed_repos:
+        logger.warning(f"Failed repos: {', '.join(failed_repos)}")
+
+
 
 def register_with_stargit(event_type='online'):
     """Send registration or heartbeat to stargit.com using token."""
