@@ -2290,7 +2290,7 @@ def collect_repo_summaries(include_remote=True):
         }
 
         print("collect_repo_summaries status:", status_data, flush=True)
-        print("summaries:", json.dumps(summaries, indent=4), flush=True)
+        print(">>>>>>>> >>> >>> >>> summaries:", json.dumps(summaries, indent=4), flush=True)
 
     return summaries
 
@@ -3246,6 +3246,7 @@ def process_tasks(tasks):
 
             remote = params.get('remote', 'origin')
             branch = params.get('branch')
+            pull_mode = params.get('pull_mode', 'ff-only')
 
             if not branch:
                 results.append({"task_id": task['id'], "error": "Branch not specified"})
@@ -3266,11 +3267,22 @@ def process_tasks(tasks):
             pull_cmd = [
                 GIT_EXECUTABLE,
                 "-C", repo_path,
-                "pull",
-                "--ff-only",     # Safer: reject merge commits unless explicitly allowed
-                remote, branch
+                "pull"
             ]
 
+            if pull_mode == "rebase":
+                pull_cmd.append("--rebase")
+            elif pull_mode == "ff-only":
+                pull_cmd.append("--ff-only")
+            elif pull_mode == "merge":
+                pull_cmd.append("--no-rebase")
+            else:
+                results.append({"task_id": task['id'], "error": f"Invalid pull_mode '{pull_mode}'"})
+                continue
+                
+            pull_cmd.append(remote)
+            pull_cmd.append(branch)
+            
             # --- 3. Execute pull ---
             result = subprocess.run(pull_cmd, capture_output=True, text=True)
 
