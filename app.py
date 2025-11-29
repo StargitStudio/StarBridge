@@ -3004,6 +3004,10 @@ def process_tasks(tasks):
         needs_status_refresh = action in STATUS_CHANGING_ACTIONS
         needs_heads_refresh = action in HEADS_CHANGING_ACTIONS
 
+        # Capture old/previous remote heads
+        if action in HEADS_CHANGING_ACTIONS:
+            task["previous_remote_heads"] = get_remote_heads(repo_path) or {}
+
         if action == 'get_file':
             file_path = params.get('file_path')
             commit_sha = params.get('commit_sha', 'HEAD')
@@ -3570,12 +3574,39 @@ def process_tasks(tasks):
                 logger.exception(f"[StarBridge] Exception while getting status for {repo_name}")
                 results.append({"task_id": task['id'], "error": str(e)})
 
+        elif action == "sync_remote_heads":
+            
+            
+            try:
+                # Optionally refresh ahead/behind
+                remote_heads = get_remote_heads(repo_path)
+                ahead, behind = get_ahead_behind(repo_path)
+                if "result" not in task_result:
+                    task_result["result"] = {}
+                task_result.update({
+                    "result": {
+                        "status": "remote_heads_synced",
+                        "remote_heads": remote_heads,
+                        "ahead": ahead,
+                        "behind": behind
+                    }
+                })
+                logger.info(f"Synced remote_heads for {repo_name} from another device")
+            except Exception as e:
+                if "error" not in task_result:
+                    task_result["error"] = {}
+                task_result.update({"error": str(e)})
+
         else:
             logger.warning(f"Unknown action: {action}")
             results.append({"task_id": task['id'], "result": None, "error": f"Unknown action: {action}"})
             continue
 
-        # === AUTO-REFRESH AHEADS AND BEHIND ON HEADS-CHANGING ACTIONS ===
+        # === AUTO-REFRESH AHEADS AND BEHIND ON HEADS-CHANGING ACTIONS: Check if remote_heads changed ===
+
+        if needs_heads_refresh or needs_status_refresh:
+            remote_heads = get_remote_heads(repo_path)
+
         if needs_heads_refresh:
             ahead, behind = get_ahead_behind(repo_path)
             if "result" not in task_result:
@@ -3583,10 +3614,22 @@ def process_tasks(tasks):
             task_result["result"]["ahead"] = ahead
             task_result["result"]["behind"] = behind
 
+            # Compare with what we had before this task
+            old_remote_heads = task.get("previous_remote_heads") or {}
+
+            if remote_heads != old_remote_heads:
+                logger.info(f"Remote heads changed for {repo_name} → broadcasting to other devices")
+
+                # Attach to result — this triggers broadcast on Stargit
+                task_result["result"]["broadcast_remote_heads"] = {
+                    "repo_name": repo_name,
+                    "remote_heads": remote_heads
+                }
+
         # === AUTO-REFRESH STATUS ON STATUS-CHANGING ACTIONS ===
         if needs_status_refresh:
             fresh_status, status_error = get_git_status_data(repo_path)
-            remote_heads = get_remote_heads(repo_path)
+            
             if status_error:
                 logger.warning(f"Failed to refresh status after {action}: {status_error}")
             else:
