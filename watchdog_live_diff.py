@@ -30,7 +30,9 @@ class LiveDiffWatcher(FileSystemEventHandler):
         self.server_uuid = server_uuid
         self.send_callback = send_callback
         self.last_trigger = 0
-        self.debounce_seconds = 0.8  # ← Use the constant!
+        self.debounce_seconds = 0.8
+        self.last_sent_diff = None
+        self.last_sent_hash = None
 
         # Auto-detect log file (for extra safety)
         self.log_file_path = None
@@ -100,13 +102,32 @@ class LiveDiffWatcher(FileSystemEventHandler):
 
         self.last_trigger = now
 
+        # === Only send if diff actually changed ===
         try:
-            rel = Path(event.src_path).relative_to(self.repo_path)
-            logger.debug(f"Live change: {self.repo_name}/{rel}")
+            current_diff = git_utils.get_diff(self.repo_path)
+            current_diff_str = current_diff.get("diff", "")
+            import hashlib
+            current_hash = hashlib.md5(current_diff_str.encode('utf-8')).hexdigest()
+
+            # FIXED: Only compare if we have sent something before
+            if self.last_sent_hash is not None and current_hash == self.last_sent_hash:
+                print(">> >> No diff change — skipping live update")
+                return
+
+            # Real change OR first time
+            self.last_sent_diff = current_diff
+            self.last_sent_hash = current_hash
+
+            rel_path = Path(event.src_path).relative_to(self.repo_path)
+            logger.info(f"Live diff changed → {self.repo_name}/{rel_path}")
+            print(f">>> LIVE UPDATE SENT: {self.repo_name}/{rel_path}", flush=True)
             self.send_callback(self.repo_path, self.repo_name)
-        except ValueError:
-            # Path not relative to repo (shouldn't happen)
-            pass
+
+        except Exception as e:
+            logger.error(f"Failed to compute diff for live update: {e}")
+
+        except Exception as e:
+            logger.error(f"Failed to compute diff for live update: {e}")
 
     def _increment_and_maybe_report(self, path: Path, reason: str):
         """Thread-safe counter + occasional whisper"""
@@ -143,7 +164,7 @@ class LiveSyncManager:
         """Start watching one repo"""
         def send_update(repo_path, repo_name):
 
-            print(f"> > > > > > > > > > > > SEND UPDATE LIVE for repo {repo_name} at path {repo_path}", flush=True)
+            #print(f"> > > > > > > > > > > > SEND UPDATE LIVE for repo {repo_name} at path {repo_path}", flush=True)
             
             try:
                 
@@ -161,21 +182,34 @@ class LiveSyncManager:
                     "timestamp": time.time()
                 }
 
-                #print("payload", json.dumps(payload, indent=4), flush=True)
-
-                # return
-          
                 access_token = token_getter()
                 if not access_token:
+                    print("No access token — aborting live update", flush=True)
                     return
 
-                requests.post(
+                print(f"Sending to {LIVE_UPDATE_ENDPOINT} with token: {access_token[:20]}...", flush=True)
+
+                ret = requests.post(
                     LIVE_UPDATE_ENDPOINT,
                     json=payload,
                     headers={"Authorization": f"Bearer {access_token}"},
                     timeout=8
                 )
-                print(f">> >> >> >> >> >> >> Live update sent for {repo_name}", flush=True)
+
+                #print(f"HTTP {ret.status_code} {ret.reason}", flush=True)
+                try:
+                    response_json = ret.json()
+                    print("Response JSON:", json.dumps(response_json, indent=2), flush=True)
+                except:
+                    print("Response text (not JSON):", ret.text, flush=True)
+
+                if ret.status_code == 403:
+                    print("403 FORBIDDEN — Your token is missing scope 'servers:live-update'")
+                    print("Fix: Regenerate API key with 'servers:live-update' scope")
+                    
+                print(f"- >> - >> - >> - >> - >> - >> - >> Live update sent for {repo_name}", flush=True)
+                print(f"- >> - >> - >> - >> - >> - >> - >> Live update ret", ret, flush=True)
+
             except Exception as e:
                 print(f"Live update failed for {name}: {e}")
                 logger.error(f"Live update failed for {name}: {e}")

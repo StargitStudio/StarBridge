@@ -1872,7 +1872,7 @@ def get_access_token():
             "Content-Type": "application/json"
         }
         payload = {
-            "scopes": "servers:register servers:heartbeat servers:poll",
+            "scopes": "servers:register servers:heartbeat servers:poll servers:live-update",
             "metadata": {  # include server context here
                 "server_uuid": SERVER_UUID
             }
@@ -2048,7 +2048,6 @@ def safe_rev_parse(repo_path, ref):
             return run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "rev-parse", "HEAD"])
         return None
     return result.strip()
-
 
 
 # Collect lightweight summaries DEPRECATED
