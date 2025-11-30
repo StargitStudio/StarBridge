@@ -366,27 +366,7 @@ def get_remotes():
         return jsonify({"error": f"Repository path '{repo_path}' not found in registered repositories"}), 400
 
     # Get list of remotes
-    try:
-        remotes = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "remote", "-v"])
-    except subprocess.CalledProcessError as e:
-        logger.error("Failed to retrieve remotes: %s", e)
-        return jsonify({"error": f"Failed to retrieve remotes: {e}"}), 500
-
-    # Parse remote information
-    remotes_info = []
-    for line in remotes.splitlines():
-        if line.strip():  # Ensure the line is not empty
-            parts = line.split()
-            if len(parts) >= 2:  # Expected format: <name> <url> (fetch/push)
-                remote_name, remote_url = parts[0], parts[1]
-                remote_type = parts[2].strip("()") if len(parts) > 2 else "unknown"
-                
-                # Append remote information to the list
-                remotes_info.append({
-                    "name": remote_name,
-                    "url": remote_url,
-                    "type": remote_type
-                })
+    remotes_info = git_utils.get_remotes(repo_path)
 
     # Return remote information
     result = {
@@ -1977,18 +1957,7 @@ def collect_repo_details():
         repo["remote_heads"] = remote_heads
 
         # Get remotes
-        remotes_info = []
-        remotes_output = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "remote", "-v"])
-        seen = set()  # To avoid duplicates if fetch/push are the same
-        for line in remotes_output.splitlines():
-            if line.strip():
-                parts = line.split()
-                if len(parts) >= 3:
-                    name, url, typ = parts[0], parts[1], parts[2].strip('()')
-                    key = (name, typ, url)
-                    if key not in seen:
-                        remotes_info.append({"name": name, "type": typ, "url": url})
-                        seen.add(key)
+        remotes_info = git_utils.get_remotes(repo_path)
         repo["remotes"] = remotes_info
         print("repo['remotes']", repo["remotes"], flush=True)
         
@@ -2228,24 +2197,8 @@ def compute_other_deltas(repo_path, branch, last_head, current_head):
     # Branches (full if changed)
     branches_data, _ = get_branches_data(repo_path)
     deltas['branches'] = branches_data
-    # Remotes (full)
-    remotes_output = run_git_command(repo_path, [GIT_EXECUTABLE, "-C", repo_path, "remote", "-v"])
-    # Parse remotes as in /api/remotes
-    remotes_info = []
-    seen = set()  # To avoid duplicates for fetch/push
-    for line in remotes_output.splitlines():
-        if line.strip():
-            parts = line.split()
-            if len(parts) >= 3:
-                remote_name, remote_url, remote_type = parts[0], parts[1], parts[2].strip('()')
-                key = (remote_name, remote_url, remote_type)
-                if key not in seen:
-                    remotes_info.append({
-                        "name": remote_name,
-                        "url": remote_url,
-                        "type": remote_type
-                    })
-                    seen.add(key)
+    
+    remotes_info = git_utils.get_remotes(repo_path)
     deltas['remotes'] = {"remotes": remotes_info}  # Match structure if needed, or just list
     # deltas['remotes'] = remotes_info # simpler structure MAYBE TBD !!!! TODO INVESTICGATE
     # Files (full ls-tree if changed)
@@ -3408,6 +3361,37 @@ def process_tasks(tasks):
                     task_result["error"] = {}
                 task_result.update({"error": str(e)})
 
+        elif action == "add_remote":
+            remote_name = params.get("remote_name", "origin")
+            remote_url = params.get("remote_url")
+
+            if not remote_url:
+                task_result.update({"error": "Remote url not defined"})
+            else:
+                try:
+                    cmd = [
+                        GIT_EXECUTABLE, "-C", str(repo_path),
+                        "remote", "add", remote_name, remote_url
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+                    if result.returncode == 0:
+                        # Refresh remotes
+                        remotes = git_utils.get_remotes(repo_path)
+                        task_result.update({
+                            "result": {
+                                "status": "remote_added",
+                                "remote_name": remote_name,
+                                "remote_url": remote_url,
+                                "remotes": remotes
+                            }
+                        })
+                        logger.info(f"Remote {remote_name} added: {remote_url}")
+                    else:
+                        task_result.update({"error": result.stderr or "git remote add failed"})
+                except Exception as e:
+                    task_result.update({"error": str(e)})
+                    
         else:
             logger.warning(f"Unknown action: {action}")
             results.append({"task_id": task['id'], "result": None, "error": f"Unknown action: {action}"})

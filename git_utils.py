@@ -181,6 +181,20 @@ def get_ahead_behind(repo_path, git="git", timeout=10):
         logger.exception(f"[ahead/behind] Unexpected error: {e}")
         return 0, 0
     
+def get_remotes(repo_path):
+    result = subprocess.run(
+        [GIT_EXECUTABLE, "-C", str(repo_path), "remote", "-v"],
+        capture_output=True, text=True
+    )
+    remotes = []
+    for line in result.stdout.splitlines():
+        if line.strip():
+            name, url_type = line.split()[:2]
+            name = name.strip()
+            url = url_type.split('\t')[0] if '\t' in url_type else url_type
+            typ = "fetch" if "(fetch)" in line else "push"
+            remotes.append({"name": name, "url": url, "type": typ})
+    return remotes
 
 def get_remote_heads(repo_path, timeout=3):
     """
