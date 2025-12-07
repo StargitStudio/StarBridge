@@ -73,6 +73,12 @@ if not PUSH_MODE:
 else:
     logger.info("PUSH_MODE is enabled in .env; repository details will be pushed to StarGit during heartbeats.")
 
+POLL_MODE = os.getenv('POLL_MODE', 'false').lower() == 'true'
+if not POLL_MODE:
+    logger.info("Zero Trust POLL_MODE is disabled in .env; repository details will not be polled from StarGit.")
+else:
+    logger.info("Zero Trust POLL_MODE is enabled in .env; repository details will be polled from StarGit.")
+
 # Token storage (in-memory)
 tokens = {
     'access_token': None,
@@ -2247,7 +2253,10 @@ def refresh_token_and_retry(access_token, func, *args, **kwargs):
     new_token = get_access_token()
     if new_token:
         logger.info("Token refreshed successfully")
-        headers["Authorization"] = f"Bearer {new_token}"
+        headers = {
+            "Authorization": f"Bearer {new_token}",
+            "Content-Type": "application/json"
+        }
         return func(*args, **kwargs)  # Retry with new headers
     else:
         logger.error("Failed to refresh token; skipping retry")
@@ -3622,7 +3631,8 @@ def poll_thread():
 if STARGIT_API_KEY:
     logger.info("Loaded STARBRIDGE_SERVER_UUID: %s", SERVER_UUID)
     threading.Thread(target=registration_thread, daemon=True).start()
-    threading.Thread(target=poll_thread, daemon=True).start()
+    if POLL_MODE and POLL_MODE == True:
+        threading.Thread(target=poll_thread, daemon=True).start()
 else:
     logger.info("No hearteat - hearbeat disabled", flush=True)
 
@@ -3641,6 +3651,7 @@ def internal_stats():
         'memory_percent': psutil.virtual_memory().percent,
         # Add more from your collect_server_metrics
     }
+    print(">>>>>>>>>>>>>>>>> Internal stats requested:", json.dumps(metrics, indent=2), flush=True)
     return jsonify(metrics)
 
 # TODO : Secure these endpoints with authentication if exposed publicly
@@ -3650,8 +3661,19 @@ def internal_logs():
     if os.path.exists(log_path):
         with open(log_path, 'r') as f:
             lines = f.readlines()[-100:]  # Last 100 lines
+            print(">>>>>>>>>>>>>>>>> Internal logs requested:", ''.join(lines), flush=True)
         return jsonify({'logs': ''.join(lines)})
     return jsonify({'logs': 'No logs found'})
+
+@app.route('/health')
+def health():
+    """Simple health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "service": "StarGit",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "version": "1.0.0"  # optional: replace with your actual version
+    }), 200
 
 # Main entry point for running the web-server for monitoring and configuration frontend
 ENABLE_FRONTEND = os.getenv('ENABLE_FRONTEND', 'true').lower() == 'true'
@@ -3679,8 +3701,8 @@ if __name__ == '__main__':
     logger.info("Starting StarBridge server")
     if SSL_MODE and SSL_MODE == 'adhoc':
         logger.warning("Starting server in adhoc SSL mode")
-        app.run(ssl_context='adhoc', host='0.0.0.0', port=5001)
+        app.run(ssl_context='adhoc', host='0.0.0.0', port=5005)
     else:
-        app.run(ssl_context=(CERT_PATH, KEY_PATH), host='0.0.0.0', port=5001)
+        app.run(ssl_context=(CERT_PATH, KEY_PATH), host='0.0.0.0', port=5005)
 
 logger.info("StarBridge server online")

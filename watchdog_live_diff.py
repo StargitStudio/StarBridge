@@ -12,9 +12,9 @@ from watchdog.events import FileSystemEventHandler
 import git_utils
 
 # === SILENCE WATCHDOG NOISE FOREVER ===
-logging.getLogger("watchdog").setLevel(logging.WARNING)
-logging.getLogger("watchdog.observers").setLevel(logging.WARNING)
-logging.getLogger("watchdog.observers.inotify_buffer").setLevel(logging.WARNING)
+logging.getLogger("watchdog").setLevel(logging.ERROR)
+logging.getLogger("watchdog.observers").setLevel(logging.ERROR)
+logging.getLogger("watchdog.observers.inotify_buffer").setLevel(logging.ERROR)
 
 logger = logging.getLogger("StarBridge.Watchdog")
 
