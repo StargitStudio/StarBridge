@@ -743,7 +743,7 @@ def get_git_status_data(repo_path, git_executable="git"):
     try:
         # Use porcelain=v2 with -z for machine-readable, unambiguous output
         result = subprocess.run(
-            [git_executable, "-C", repo_path, "status", "--porcelain=v2", "-z", "--branch"],
+            [git_executable, "-C", repo_path, "status", "--untracked-files=all", "--porcelain=v2", "-z", "--branch"],
             capture_output=True,
             text=True,
             check=True
@@ -3449,15 +3449,8 @@ def process_tasks(tasks):
                     
         elif action == "run_ci":
             start_time = time.time()
-            repo_name = params.get("repo_name")
             event_name = params.get("event", "manual")
             runner_id = params.get("runner_id")  # optional: specific runner
-
-            repo_path = find_repo_path_by_name(repo_name)
-            if not repo_path:
-                task_result.update({"error": "Repo not found"})
-                results.append(task_result)
-                continue
 
             try:
                 logger.info(f"Running CI/CD for {repo_name} → event: {event_name}")
@@ -3511,7 +3504,7 @@ def process_tasks(tasks):
             except Exception as e:
                 task_result.update({"error": str(e)})
                 logger.exception(f"CI/CD crashed for {repo_name}")
-
+ 
         else:
             logger.warning(f"Unknown action: {action}")
             results.append({"task_id": task['id'], "result": None, "error": f"Unknown action: {action}"})
